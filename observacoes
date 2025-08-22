@@ -1,2 +1,4 @@
 gcc 12
 as vezes tem que apagar a pasta de build e fazer o build de novo no flexric
+sudo apt install ninja-build
+build_oai -I
