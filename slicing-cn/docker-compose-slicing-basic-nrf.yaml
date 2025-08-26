@@ -202,6 +202,29 @@ services:
                 ipv4_address: 192.168.70.145
             public_net_core:
                 ipv4_address: 192.168.73.145
+    ads:
+        container_name: "ads"
+        build:
+            context: ..
+            dockerfile: Dockerfile
+        networks:
+            public_net:
+                ipv4_address: 192.168.70.150
+        expose:
+            - 8082/tcp
+    ork:
+        container_name: "ork"
+        build:
+            context: ..
+            dockerfile: Dockerfile.ork
+        environment:
+            - ADS_IP=192.168.70.150
+            - XAPP_IP=192.168.70.1
+        depends_on:
+            - ads
+        networks:
+            public_net:
+                ipv4_address: 192.168.70.151
 networks:
     public_net:
         driver: bridge
