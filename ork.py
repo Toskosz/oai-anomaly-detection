@@ -3,6 +3,7 @@ import time
 import pickle
 import threading
 import pandas as pd
+import numpy as np
 import json
 from concrete.ml.deployment import FHEModelClient
 
@@ -12,8 +13,8 @@ LISTENING_IP = "0.0.0.0"
 LISTENING_PORT = 8585
 
 # ADS Server (FHE Model Server) details
-ADS_IP = "127.0.0.1"  # TODO: Replace with the actual IP of the ADS server
-ADS_PORT = 9000       # TODO: Replace with the actual port of the ADS server
+ADS_IP = "127.0.0.1"  # IP of the anomaly-detection-server
+ADS_PORT = 9000       # Port of the anomaly-detection-server
 
 # xApp connection details
 XAPP_IP = "192.168.70.1"
@@ -33,7 +34,7 @@ anomaly_count = 0
 count_lock = threading.Lock()
 
 def load_fhe_client_and_preprocessor():
-    """Loads the FHE client, evaluation keys, and the preprocessor."""
+    """Loads the FHE client and the preprocessor."""
     try:
         print("[INFO] Loading FHE client and preprocessor...")
         fhe_model_client = FHEModelClient(MODEL_PATH)
@@ -45,26 +46,36 @@ def load_fhe_client_and_preprocessor():
         print(f"[ERROR] Could not load FHE model or preprocessor: {e}")
         exit(1)
 
-def send_to_ads_server(encrypted_input):
+def recv_all(sock, n):
+    """Helper function to receive n bytes from a socket."""
+    data = bytearray()
+    while len(data) < n:
+        packet = sock.recv(n - len(data))
+        if not packet:
+            return None
+        data.extend(packet)
+    return data
+
+def get_fhe_prediction(encrypted_input):
     """Sends encrypted data to the ADS server and returns the encrypted prediction."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((ADS_IP, ADS_PORT))
+            
+            # Send encrypted input
             s.sendall(len(encrypted_input).to_bytes(8, 'big'))
             s.sendall(encrypted_input)
 
-            size_bytes = s.recv(8)
+            # Receive the size of the encrypted output
+            size_bytes = recv_all(s, 8)
             if not size_bytes:
                 return None
             size = int.from_bytes(size_bytes, 'big')
 
-            encrypted_output = b''
-            while len(encrypted_output) < size:
-                packet = s.recv(size - len(encrypted_output))
-                if not packet:
-                    return None
-                encrypted_output += packet
+            # Receive the encrypted output
+            encrypted_output = recv_all(s, size)
             return encrypted_output
+
     except Exception as e:
         print(f"[ERROR] Could not communicate with ADS server: {e}")
         return None
@@ -80,7 +91,8 @@ def flow_processing(flow_data_json, preprocessor, fhe_client):
         X_processed = preprocessor.transform(df).toarray()
         encrypted_input = fhe_client.quantize_encrypt_serialize(X_processed)
 
-        encrypted_output = send_to_ads_server(encrypted_input)
+        # Get prediction from ADS server
+        encrypted_output = get_fhe_prediction(encrypted_input)
 
         if encrypted_output:
             result = fhe_client.deserialize_decrypt_dequantize(encrypted_output)
@@ -136,18 +148,16 @@ def main():
         conn, addr = server_socket.accept()
         print(f"[INFO] UPF connected from {addr}")
 
-        # Start the stats thread only after the UPF is connected
         stats_thread = threading.Thread(target=send_stats_to_xapp, args=(xapp_sock,))
         stats_thread.daemon = True
         stats_thread.start()
 
         with conn:
-            # Use makefile to read line-buffered data
             fileobj = conn.makefile('r')
             while True:
                 line = fileobj.readline()
                 if not line:
-                    break # Connection closed by UPF
+                    break
                 flow_processing(line.strip(), preprocessor, fhe_client)
 
     print("[INFO] UPF disconnected. Shutting down.")
