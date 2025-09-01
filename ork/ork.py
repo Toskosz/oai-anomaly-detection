@@ -3,21 +3,16 @@ import time
 import pickle
 import threading
 import pandas as pd
-import numpy as np
 import json
 from concrete.ml.deployment import FHEModelClient
 
-# --- Configuration ---
-# UPF Flow Data Listener
-LISTENING_IP = "0.0.0.0"
+LISTENING_IP = "127.0.0.1"
 LISTENING_PORT = 8585
 
-# ADS Server (FHE Model Server) details
-ADS_IP = "127.0.0.1"  # IP of the anomaly-detection-server
-ADS_PORT = 9000       # Port of the anomaly-detection-server
+ADS_IP = "127.0.0.1"
+ADS_PORT = 9000
 
-# xApp connection details
-XAPP_IP = "192.168.70.1"
+XAPP_IP = "127.0.0.1"
 XAPP_PORT = 8080
 
 # Slice details
@@ -25,8 +20,8 @@ SST = 1
 SD = 1
 
 # FHE model details
-MODEL_PATH = "./kdcup-models/fhe_model_4_estimators_4_depth/"
-PREPROCESSOR_PATH = "notebooks/preprocessor.pkl"
+MODEL_PATH = "./fhe_model_2_estimators_2_depth/"
+PREPROCESSOR_PATH = "./preprocessor.pkl"
 
 # --- Global Variables ---
 normal_count = 0
@@ -74,7 +69,9 @@ def get_fhe_prediction(encrypted_input):
 
             # Receive the encrypted output
             encrypted_output = recv_all(s, size)
-            return encrypted_output
+            if encrypted_output is not None:
+                return bytes(encrypted_output)
+            return None
 
     except Exception as e:
         print(f"[ERROR] Could not communicate with ADS server: {e}")
