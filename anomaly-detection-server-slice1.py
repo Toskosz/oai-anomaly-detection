@@ -19,7 +19,6 @@ import pandas as pd
 from scapy.layers.inet import *
 from scapy.all import *
 from scapy.contrib.gtp import GTP_U_Header
-import numpy as np
 import warnings
 
 # Suppress Scapy's verbose warnings
@@ -97,7 +96,7 @@ def extract_features(packet):
             flow_data['dst_bytes'] += len(packet[Raw].load)
 
 # --- MAIN PACKET PROCESSING AND ML INFERENCE ---
-def preprocess(ue_ip):
+def preprocess():
     """
     Takes a full window of traffic for a UE and preprocesses it.
     """
@@ -117,24 +116,19 @@ def packet_handler(packet):
         return
 
     inner_ip_packet = packet[GTP_U_Header][IP]
-    ue_ip = inner_ip_packet.src
-
     extract_features(inner_ip_packet)
 
     # If window is full, process and report
     if packet_count >= WINDOW_SIZE:
         print(f"Window full, analyzing traffic...")
-        
-        # Get anomaly percentage from the ML model
-        data = preprocess(ue_ip)
-        
+        data = preprocess()
+
         print(f"Analysis complete. DATA = {data}")
 
-        # Send the result to the xApp
-        report_to_xapp(ue_ip, data)
+        report_to_xapp()
 
 # --- COMMUNICATION WITH XAPP ---
-def report_to_xapp(ue_ip, percentage):
+def report_to_xapp():
     """
     Connects to the xApp and sends the anomaly report.
     Format: "UE_IP,ANOMALY_PERCENTAGE"
@@ -142,14 +136,13 @@ def report_to_xapp(ue_ip, percentage):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((XAPP_HOST, XAPP_PORT))
-            message = f"{ue_ip},{percentage}"
+            message = f"{flow_data['protocol_type']},{flow_data['service']},{flow_data['src_bytes']},{flow_data['dst_bytes']}"
             s.sendall(message.encode('utf-8'))
             print(f"Report sent to xApp: {message}")
     except ConnectionRefusedError:
         print(f"ERROR: Connection to xApp at {XAPP_HOST}:{XAPP_PORT} refused. Is the xApp running?")
     except Exception as e:
         print(f"An error occurred while sending report to xApp: {e}")
-
 
 # --- MAIN EXECUTION BLOCK ---
 if __name__ == "__main__":
