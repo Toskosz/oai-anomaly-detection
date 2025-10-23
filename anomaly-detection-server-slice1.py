@@ -86,8 +86,8 @@ def extract_features(packet):
             flow_data['service'] = PORT_TO_SERVICE.get(proto_layer.dport, 'other')
 
     # 4 & 5. Get Bytes (payload size)
-    # Traffic from UE (e.g. 12.2.1.1 -> 12.2.1.2) is 'src_bytes'
-    if packet[IP].src == "12.2.1.1":
+    # Traffic from UE (e.g. 12.2.1.2 -> 12.2.1.1) is 'src_bytes'
+    if packet[IP].src == "12.2.1.2":
         if packet.haslayer(Raw):
             flow_data['src_bytes'] += len(packet[Raw].load)
     # Traffic to UE is 'dst_bytes'
