@@ -26,23 +26,18 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # --- CONFIGURATION ---
-XAPP_HOST = '192.168.70.1'  # IP of the machine running the RIC/xApp (likely the AMF's IP in this setup)
+XAPP_HOST = '192.168.70.1'    # IP of the machine running the RIC/xApp (likely the AMF's IP in this setup)
 XAPP_PORT = 8080              # Arbitrary port for communication with the xApp
 CAPTURE_INTERFACE = "eth0"    # Interface inside the UPF container that sees the de-tunneled user traffic
-WINDOW_SIZE = 30              # Number of packets to analyze per user before sending a report
+WINDOW_SIZE = 10              # Number of packets to analyze per user before sending a report
 PREPROCESSOR_PATH = ''
-
-# --- DATA STRUCTURES ---
-# This dictionary will hold the packet feature data for each UE's sliding window.
-# Key: UE's inner IP address (e.g., '12.2.1.2')
-# Value: A list of feature dictionaries for the last N packets.
-ue_traffic_window = {}
 
 # --- LOAD PRE-TRAINED ML COMPONENTS ---
 # These must be loaded once at the start for efficiency.
 try:
     print("Loading preprocessors...")
-    preprocessor = 
+    with open(PREPROCESSOR_PATH, "rb") as f:
+        preprocessor = pickle.load(f)
     print("preprocessors loaded successfully.")
 except FileNotFoundError:
     print(f"ERROR: preprocessor files not found. Make sure '{PREPROCESSOR_PATH}' is in the same directory.")
@@ -56,9 +51,14 @@ PORT_TO_SERVICE = {
     23: 'telnet', 143: 'imap4', 22: 'ssh', 53: 'domain', 7: 'echo', 9: 'discard',
 }
 
-FLAG_TO_DATASET = {
-    'S': 'S0', 'R': 'RSTO', 'RA': 'RSTR', 'PA': 'SF', 'SA': 'S1' # Simplified mapping
+flow_data = {
+    'protocol_type': 'other',
+    'service': 'other',
+    'src_bytes': 0,
+    'dst_bytes': 0
 }
+packet_count = 0
+
 
 def extract_features(packet):
     """
@@ -68,69 +68,44 @@ def extract_features(packet):
     if not packet.haslayer(IP):
         return None
 
-    # Default values
-    features = {
-        'protocol_type': 'other',
-        'service': 'other',
-        'flag': 'OTH',
-        'src_bytes': 0,
-        'dst_bytes': 0
-    }
+    if packet_count == 0:
+        # 1. Get Protocol
+        if packet.haslayer(TCP):
+            flow_data['protocol_type'] = 'tcp'
+            proto_layer = packet[TCP]
+        elif packet.haslayer(UDP):
+            flow_data['protocol_type'] = 'udp'
+            proto_layer = packet[UDP]
+        elif packet.haslayer(ICMP):
+            flow_data['protocol_type'] = 'icmp'
+            proto_layer = packet[ICMP]
+        else:
+            return None # We only care about TCP, UDP, ICMP for this model
 
-    # 1. Get Protocol
-    if packet.haslayer(TCP):
-        features['protocol_type'] = 'tcp'
-        proto_layer = packet[TCP]
-        # 3. Get Flag (for TCP only)
-        # Scapy flags are represented as a string like 'S' for SYN, 'A' for ACK, etc.
-        features['flag'] = FLAG_TO_DATASET.get(str(proto_layer.flags), 'OTH')
-    elif packet.haslayer(UDP):
-        features['protocol_type'] = 'udp'
-        proto_layer = packet[UDP]
-    elif packet.haslayer(ICMP):
-        features['protocol_type'] = 'icmp'
-        proto_layer = packet[ICMP]
-    else:
-        return None # We only care about TCP, UDP, ICMP for this model
-
-    # 2. Get Service (from destination port)
-    if hasattr(proto_layer, 'dport'):
-        features['service'] = PORT_TO_SERVICE.get(proto_layer.dport, 'other')
+        # 2. Get Service (from destination port)
+        if hasattr(proto_layer, 'dport'):
+            flow_data['service'] = PORT_TO_SERVICE.get(proto_layer.dport, 'other')
 
     # 4 & 5. Get Bytes (payload size)
-    # The paper differentiates src and dst bytes, which implies analyzing a full connection.
-    # Here, we approximate based on packet direction.
-    # Traffic from UE (e.g. 12.2.1.2 -> 12.2.1.1) is 'src_bytes'
-    if packet[IP].src.startswith("12."):
-         if packet.haslayer(Raw):
-             features['src_bytes'] = len(packet[Raw].load)
+    # Traffic from UE (e.g. 12.2.1.1 -> 12.2.1.2) is 'src_bytes'
+    if packet[IP].src == "12.2.1.1":
+        if packet.haslayer(Raw):
+            flow_data['src_bytes'] += len(packet[Raw].load)
     # Traffic to UE is 'dst_bytes'
     else:
         if packet.haslayer(Raw):
-            features['dst_bytes'] = len(packet[Raw].load)
-
-    return features
+            flow_data['dst_bytes'] += len(packet[Raw].load)
 
 # --- MAIN PACKET PROCESSING AND ML INFERENCE ---
-def process_and_predict(ue_ip):
+def preprocess(ue_ip):
     """
-    Takes a full window of traffic for a UE, preprocesses it,
-    gets a prediction from the model, and returns the anomaly percentage.
+    Takes a full window of traffic for a UE and preprocesses it.
     """
-    window_data = ue_traffic_window[ue_ip]
-    df = pd.DataFrame(window_data)
 
-    # Separate categorical and numerical features for preprocessing
-    categorical_features = ['protocol_type', 'service', 'flag']
-    numerical_features = ['src_bytes', 'dst_bytes']
+    df = pd.DataFrame(flow_data)
+    X_processed = preprocessor.transform(df).toarray()
 
-    # Apply One-Hot Encoding and Min-Max Scaling
-    encoded_data = encoder.transform(df[categorical_features])
-    scaled_data = scaler.transform(df[numerical_features])
-    # Combine preprocessed features
-    processed_df = np.hstack([encoded_data.toarray(), scaled_data])
-
-    return processed_df
+    return X_processed
 
 def packet_handler(packet):
     """
@@ -144,36 +119,19 @@ def packet_handler(packet):
     inner_ip_packet = packet[GTP_U_Header][IP]
     ue_ip = inner_ip_packet.src
 
-    # Identify UE based on source IP prefix, as per traffic generator
-    if not ue_ip.startswith("12."):
-        return
-
-    # Extract features from the inner packet
-    features = extract_features(inner_ip_packet)
-    if features is None:
-        return
-
-    # Initialize window for new UE
-    if ue_ip not in ue_traffic_window:
-        ue_traffic_window[ue_ip] = []
-
-    # Add features to the UE's window
-    ue_traffic_window[ue_ip].append(features)
+    extract_features(inner_ip_packet)
 
     # If window is full, process and report
-    if len(ue_traffic_window[ue_ip]) >= WINDOW_SIZE:
-        print(f"Window full for UE {ue_ip}. Analyzing traffic...")
+    if packet_count >= WINDOW_SIZE:
+        print(f"Window full, analyzing traffic...")
         
         # Get anomaly percentage from the ML model
-        data = process_and_predict(ue_ip)
+        data = preprocess(ue_ip)
         
-        print(f"Analysis complete for UE {ue_ip}: DATA = {data}")
+        print(f"Analysis complete. DATA = {data}")
 
         # Send the result to the xApp
         report_to_xapp(ue_ip, data)
-
-        # Clear the window for the next batch of packets
-        ue_traffic_window[ue_ip] = []
 
 # --- COMMUNICATION WITH XAPP ---
 def report_to_xapp(ue_ip, percentage):
@@ -199,7 +157,6 @@ if __name__ == "__main__":
     print(f"Starting packet capture on interface: {CAPTURE_INTERFACE}")
     print(f"Will report to xApp at: {XAPP_HOST}:{XAPP_PORT}")
 
-    # Start sniffing packets. The packet_handler function will be called for each packet.
     # The store=0 argument prevents Scapy from keeping all packets in memory.
     try:
         sniff(iface=CAPTURE_INTERFACE, prn=packet_handler, store=0)
