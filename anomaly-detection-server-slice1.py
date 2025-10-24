@@ -129,14 +129,12 @@ def packet_handler(packet):
 
 # --- COMMUNICATION WITH XAPP ---
 def report_to_xapp():
-    """
-    Connects to the xApp and sends the anomaly report.
-    Format: "UE_IP,ANOMALY_PERCENTAGE"
-    """
+    sst = 1
+    sd = 1
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((XAPP_HOST, XAPP_PORT))
-            message = f"{flow_data['protocol_type']},{flow_data['service']},{flow_data['src_bytes']},{flow_data['dst_bytes']}"
+            message = f"{sst},{sd},{flow_data['protocol_type']},{flow_data['service']},{flow_data['src_bytes']},{flow_data['dst_bytes']}"
             s.sendall(message.encode('utf-8'))
             print(f"Report sent to xApp: {message}")
     except ConnectionRefusedError:
