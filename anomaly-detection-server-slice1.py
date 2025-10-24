@@ -134,7 +134,17 @@ def report_to_xapp():
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((XAPP_HOST, XAPP_PORT))
-            message = f"{sst},{sd},{flow_data['protocol_type']},{flow_data['service']},{flow_data['src_bytes']},{flow_data['dst_bytes']}"
+
+            report_data = {
+                "sst": sst,
+                "sd": sd,
+                "protocol_type": flow_data['protocol_type'],
+                "service": flow_data['service'],
+                "src_bytes": flow_data['src_bytes'],
+                "dst_bytes": flow_data['dst_bytes']
+            }
+
+            message = json.dumps(report_data) + "\n"
             s.sendall(message.encode('utf-8'))
             print(f"Report sent to xApp: {message}")
     except ConnectionRefusedError:
