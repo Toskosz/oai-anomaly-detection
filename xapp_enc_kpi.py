@@ -1,4 +1,3 @@
-
 import socket
 import time
 import threading
@@ -6,22 +5,44 @@ import pandas as pd
 import json
 from concrete.ml.deployment import FHEModelClient
 import sys
+import sqlite3
 
 # Listen on all available interfaces for the UPF connection
 LISTENING_IP = "0.0.0.0"
 LISTENING_PORT = 8080
 
-# xApp/App server details
-XAPP_IP = "192.168.70.1"
-XAPP_PORT = 8081
-
-# FHE ADS Server details (PLACEHOLDER - Configure as needed)
-ADS_IP = "127.0.0.1"
-ADS_PORT = 9000
-
 # FHE model details
 MODEL_PATH = "./fhe_model_2_estimators_2_depth/"
 
+# --- Database constants ---
+DB_NAME = "xapp_comm.db"
+POLLING_INTERVAL = 1  # Seconds to wait between polling 
+
+def setup_database(db_name):
+    """Creates the necessary SQLite tables if they don't exist."""
+    print(f"[INFO] Setting up database: {db_name}")
+    try:
+        with sqlite3.connect(db_name) as conn:
+            cursor = conn.cursor()
+            
+            # Table for messages FROM orchestrator TO xApp (Function Y)
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sst INTEGER NOT NULL,
+                sd INTEGER NOT NULL,
+                data BLOB NOT NULL,
+                anomaly_flag INTEGER,
+                status INTEGER NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """)
+
+            conn.commit()
+            print("[INFO] Database table 'messages' is ready.")
+    except sqlite3.Error as e:
+        print(f"[ERROR] Failed to set up database: {e}")
+        sys.exit(1)
 
 def load_fhe_client():
     """Loads the FHE client."""
@@ -33,118 +54,61 @@ def load_fhe_client():
         print(f"[ERROR] Could not load FHE model: {e}")
         sys.exit(1)
 
-
-def recv_all(sock, n):
-    """Helper function to receive n bytes from a socket."""
-    data = bytearray()
-    while len(data) < n:
-        packet = sock.recv(n - len(data))
-        if not packet:
-            return None
-        data.extend(packet)
-    return data
-
-def get_fhe_prediction(encrypted_input):
-    """Sends encrypted data to the ADS server and returns the encrypted prediction."""
+def decipher_model_response(encrypted_data, db_name, row_id, fhe_client):
+    print(f"[DB_RECV] Processing job {row_id} with {len(encrypted_data)} encrypted bytes from DB.")
     try:
-        # Use a new socket for each prediction request
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((ADS_IP, ADS_PORT))
-            
-            # Send encrypted input
-            s.sendall(len(encrypted_input).to_bytes(8, 'big'))
-            s.sendall(encrypted_input)
-
-            # Receive the size of the encrypted output
-            size_bytes = recv_all(s, 8)
-            if not size_bytes:
-                print("[ERROR] Did not receive size from ADS server.")
-                return None
-            size = int.from_bytes(size_bytes, 'big')
-
-            # Receive the encrypted output
-            encrypted_output = recv_all(s, size)
-            if encrypted_output is not None:
-                return bytes(encrypted_output)
-            
-            print("[ERROR] Did not receive encrypted output from ADS server.")
-            return None
-
-    except socket.error as e:
-        print(f"[ERROR] Socket error communicating with ADS server: {e}")
-        return None
-    except Exception as e:
-        print(f"[ERROR] Could not communicate with ADS server: {e}")
-        return None
-
-def send_decipher_model_response(encrypted_data, xapp_sock, fhe_client):
-    """
-    Handles encrypted messages received from the xApp (Function X).
-    Receives encrypted data, decrypts it, and sends the result back.
-    """
-    print(f"[XAPP_RECV] Received {len(encrypted_data)} encrypted bytes from xApp.")
-    
-    # --- Start of Function X logic ---
-    response_bytes = b''
-    try:
-        # Decrypt the data received from the xApp
         result = fhe_client.deserialize_decrypt_dequantize(encrypted_data)
-        
-        # Convert numpy array to list for JSON serialization
-        result_list = result.tolist()
-        response_json = json.dumps(result_list)
-        response_bytes = response_json.encode('utf-8')
-        print(f"[INFO] Decrypted message from xApp. Result: {response_json}")
+        prediction = 1 if result[0][1] > 0.5 else 0
 
+        if prediction == 1:
+            try:
+                with sqlite3.connect(db_name) as conn:
+                    conn.execute("""
+                        UPDATE messages
+                        SET anomaly_flag = 1,
+                            status = 2
+                        WHERE id = ?
+                    """, (row_id))
+                    conn.commit()
+            except Exception as e:
+                print(f"[ERROR] Failed to write to 'predictions' table for job {row_id}: {e}")
+        else:
+            print(f"[INFO] Job {row_id} is NORMAL ({result[0][1]}). Deleting prediction from DB.")
+            try:
+                with sqlite3.connect(db_name) as conn:
+                    conn.execute("""
+                        DELETE from messages
+                        WHERE id = ?
+                    """, (row_id))
+                    conn.commit()
+            except Exception as e:
+                print(f"[ERROR] Failed to write to 'predictions' table for job {row_id}: {e}")
     except Exception as e:
         print(f"[ERROR] Failed to decrypt message from xApp: {e}")
-        response_json = json.dumps({"error": f"Failed to decrypt: {e}"})
-        response_bytes = response_json.encode('utf-8')
-    # --- End of Function X logic ---
-    
-    try:
-        print(f"[XAPP_SEND] Sending decrypted response ({len(response_bytes)} bytes) to xApp.")
-        # Send the response back with a length prefix
-        xapp_sock.sendall(len(response_bytes).to_bytes(8, 'big'))
-        xapp_sock.sendall(response_bytes)
-    except Exception as e:
-        print(f"[ERROR] Failed to send response to xApp: {e}")
 
-def function_Y(flow_data_json, fhe_client, xapp_sock):
-    """
-    Processes a message from the UPF (Function Y).
-    This involves FHE encryption, getting a prediction,
-    and sending the *encrypted prediction* to the xApp.
-    """
+def send_cipher_to_xapp(flow_data_json, fhe_client, db_name):
     print(f"[UPF_RECV] Received from UPF: {flow_data_json[:70]}...") # Log truncated message
     
-    # --- Start of Function Y logic ---
     try:
         pre_processed_flow_data = json.loads(flow_data_json)
         df = pd.DataFrame([pre_processed_flow_data])
         df_for_model = df.drop(columns=['sst', 'sd'])
 
-        # Encrypt the input flow data
         encrypted_input = fhe_client.quantize_encrypt_serialize(df_for_model)
+        sst = int(df["sst"].iloc[0])
+        sd = int(df["sd"].iloc[0])
 
-        # Get encrypted prediction from ADS server
-        encrypted_output = get_fhe_prediction(encrypted_input)
 
-        if encrypted_output:
-
-            result = fhe_client.deserialize_decrypt_dequantize(encrypted_output)
-            prediction = 1 if result[0][1] > 0.5 else 0
-
-            message = f"sst:{df['sst']},sd:{df['sd']},anomaly:{prediction}"
-
-            try:
-                print(f"[XAPP_SEND] Sending prediction ({len(message)} bytes) to xApp.")
-                # Send with length prefix
-                xapp_sock.sendall(message.encode())
-            except Exception as e:
-                print(f"[ERROR] Failed to send encrypted prediction to xApp: {e}")
-        else:
-            print("[WARN] No encrypted output received from ADS. Nothing sent to xApp.")
+        try:
+            print(f"[DB_WRITE_TO_XAPP] Writing upf data to database.")
+            with sqlite3.connect(db_name) as conn:
+                conn.execute("""
+                    INSERT INTO messages (sst, sd, data, status) 
+                    VALUES (?, ?, ?, 0)
+                """, (sst, sd, encrypted_input))
+                conn.commit()
+        except Exception as e:
+            print(f"[ERROR] Failed to write message to database for xApp: {e}")
 
     except json.JSONDecodeError:
         print(f"[ERROR] Received invalid JSON data from UPF: {flow_data_json}")
@@ -156,19 +120,17 @@ def function_Y(flow_data_json, fhe_client, xapp_sock):
         print(f"[ERROR] Error in FHE processing (function_Y): {e}")
         return
 
-def listen_to_upf(upf_conn, fhe_client, xapp_sock):
-    """Worker thread to listen for messages from UPF."""
+def listen_to_upf(upf_conn, fhe_client, db_name):
     print("[INFO] UPF listener thread started.")
     try:
-        # Use makefile for convenient readline()
         with upf_conn, upf_conn.makefile('r') as fileobj:
             while True:
                 line = fileobj.readline()
                 if not line:
                     print("[INFO] UPF disconnected.")
                     break
-                # Call Function Y
-                function_Y(line.strip(), fhe_client, xapp_sock)
+                send_cipher_to_xapp(line.strip(), fhe_client, db_name)
+
     except (IOError, socket.error) as e:
         print(f"[INFO] UPF connection error: {e}")
     except Exception as e:
@@ -176,29 +138,48 @@ def listen_to_upf(upf_conn, fhe_client, xapp_sock):
     finally:
         print("[INFO] UPF listener thread stopped.")
 
-def listen_to_xapp(xapp_sock, fhe_client):
+def listen_to_xapp(db_name, fhe_client):
     """Worker thread to listen for messages from xApp."""
     print("[INFO] xApp listener thread started.")
     try:
         while True:
-            # Receive the size of the encrypted input
-            size_bytes = recv_all(xapp_sock, 8)
-            if not size_bytes:
-                print("[INFO] xApp disconnected (no size bytes).")
-                break
-            size = int.from_bytes(size_bytes, 'big')
+            row_to_process = None
+            try:
+                with sqlite3.connect(db_name) as conn:
+                    conn.row_factory = sqlite3.Row
+                    with conn:
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            SELECT id,
+                                sst,
+                                sd,
+                                data
+                            FROM messages
+                            WHERE status = 1
+                            ORDER BY timestamp
+                            LIMIT 1
+                        """)
+                        row_to_process = cursor.fetchone()
+                        if row_to_process:
+                            print(f"[DB_RECV_FROM_XAPP] Found job id {row_to_process['id']}. Setting to 'pending'.")
+            except sqlite3.Error as e:
+                print(f"[ERROR] DB transaction error in KPI xApp: {e}")
 
-            # Receive the encrypted input
-            encrypted_data = recv_all(xapp_sock, size)
-            if not encrypted_data:
-                print("[INFO] xApp disconnected (no data).")
-                break
-            
-            # Call Function X
-            send_decipher_model_response(bytes(encrypted_data), xapp_sock, fhe_client)
+            if row_to_process:
+                try:
+                    decipher_model_response(
+                        bytes(row_to_process['data']), 
+                        db_name,
+                        row_to_process['id'], 
+                        fhe_client
+                    )
+                except Exception as e:
+                    print(f"[ERROR] Failed during job processing for {row_to_process['id']}: {e}")
+            else:
+                time.sleep(POLLING_INTERVAL)
 
-    except (IOError, socket.error) as e:
-        print(f"[INFO] xApp connection error: {e}")
+    except sqlite3.Error as e:
+        print(f"[INFO] xApp listener DB error: {e}")
     except Exception as e:
         print(f"[ERROR] Unhandled error in xApp listener: {e}")
     finally:
@@ -209,8 +190,8 @@ def main():
     """Main function to set up connections and start listener threads."""
 
     fhe_client = load_fhe_client()
+    setup_database(DB_NAME)
 
-    xapp_sock = None
     upf_conn = None
     server_socket = None
     
@@ -218,20 +199,6 @@ def main():
     xapp_thread = None
 
     try:
-        while True:
-            try:
-                print(f"[INFO] Connecting to xApp at {XAPP_IP}:{XAPP_PORT}...")
-                xapp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                xapp_sock.connect((XAPP_IP, XAPP_PORT))
-                print("[INFO] Connected to xApp.")
-                break
-            except socket.error as e:
-                print(f"[ERROR] Socket error when connecting to xApp: {e}. Retrying in 5 seconds...")
-                time.sleep(5)
-            except KeyboardInterrupt:
-                print("\n[INFO] Shutdown requested during xApp connection.")
-                sys.exit(0)
-
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind((LISTENING_IP, LISTENING_PORT))
@@ -242,8 +209,8 @@ def main():
         print(f"[INFO] UPF connected from {addr}")
 
         # 3. Start listener threads for both connections
-        upf_thread = threading.Thread(target=listen_to_upf, args=(upf_conn, fhe_client, xapp_sock))
-        xapp_thread = threading.Thread(target=listen_to_xapp, args=(xapp_sock, fhe_client))
+        upf_thread = threading.Thread(target=listen_to_upf, args=(upf_conn, fhe_client, DB_NAME))
+        xapp_thread = threading.Thread(target=listen_to_xapp, args=(DB_NAME, fhe_client))
         
         upf_thread.daemon = True
         xapp_thread.daemon = True
@@ -263,14 +230,10 @@ def main():
         print(f"[ERROR] Main thread encountered an error: {e}")
     finally:
         print("[INFO] Cleaning up and shutting down.")
-        if xapp_sock:
-            xapp_sock.close()
         if upf_conn:
             upf_conn.close()
         if server_socket:
             server_socket.close()
-        
-        # Wait for threads to finish
         if upf_thread and upf_thread.is_alive():
             upf_thread.join(1)
         if xapp_thread and xapp_thread.is_alive():
