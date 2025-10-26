@@ -7,7 +7,7 @@
  * except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.openairinterface.org/?page_id=698
+ * http://www.openairinterface.org/?page_id=698
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,7 +16,7 @@
  * limitations under the License.
  *-------------------------------------------------------------------------------
  * For more information about the OpenAirInterface (OAI) Software Alliance:
- *      contact@openairinterface.org
+ * contact@openairinterface.org
  */
 
 #include "../../../../src/xApp/e42_xapp_api.h"
@@ -32,36 +32,28 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <sys/socket.h>
-
+#include <sqlite3.h> // Added for SQLite functionality
+#include <stdbool.h> // Added for bool type
 
 #define PORT 8080
-#define MAX_CLIENTS 2
+#define MAX_CLIENTS 2 // Represents the number of slices we are managing
 #define BUFFER_SIZE 2000
 #define SERVER_IP "192.168.70.1" // Replace with your server's IP address
+#define DB_PATH "messages.db" // Path to the SQLite database
+#define POLLING_INTERVAL_US 1000000 // Poll database every 1 second
 
-typedef struct {
-    int socket;
-    int client_id;
-} client_data_t;
-
+// Holds the state for each slice being managed
 typedef struct {
     int sst;
     int sd;
-    int normal_count;
-    int anomaly_count;
-    int prb_allocation;
-    int prev_prb_allocation;
-    int rrc_ue_id;
+    int prb_allocation;      // Current PRB allocation (0 or 100)
+    int prev_prb_allocation; // Previous PRB allocation
+    int rrc_ue_id;           // Mapped RRC UE ID for release
 } ue_data_t;
 
 
 ue_data_t ue_data[MAX_CLIENTS];
-int client_sockets[MAX_CLIENTS];
-int clients_connected = 0;
-int messages_received = 0;
-
-pthread_mutex_t lock;
-pthread_cond_t cond;
+sqlite3 *db; // SQLite database handle
 
 typedef enum{
     DRX_parameter_configuration_7_6_3_1 = 1,
@@ -235,15 +227,16 @@ static void gen_rrm_policy_ratio_list(seq_ran_param_t* RRM_Policy_Ratio_List) {
     RRM_Policy_Ratio_List->ran_param_val.lst->lst_ran_param = calloc(num_slice, sizeof(lst_ran_param_t));
     assert(RRM_Policy_Ratio_List->ran_param_val.lst->lst_ran_param != NULL && "Memory exhausted");
 
+    // This function now reads from the global ue_data state
     for (int i = 0; i < num_slice; i++) {
-        char sst_str[2];
-        char sd_str[2];
+        char sst_str[12]; // Increased size for safety
+        char sd_str[12];
         snprintf(sst_str, sizeof(sst_str), "%d", ue_data[i].sst);
         snprintf(sd_str, sizeof(sd_str), "%d", ue_data[i].sd);
         gen_rrm_policy_ratio_group(&RRM_Policy_Ratio_List->ran_param_val.lst->lst_ran_param[i],
                                    sst_str,
                                    sd_str,
-                                   0, ue_data[i].prb_allocation, 0);
+                                   0, ue_data[i].prb_allocation, 0); // Min=0, Max=0, Dedicated=our_value
     }
 
     return;
@@ -313,210 +306,194 @@ ue_id_e2sm_t gen_rc_ue_id(ue_id_e2sm_e type)
 }
 
 
-void *client_handler(void *client_data) {
-    client_data_t *data = (client_data_t*)client_data;
-    int sock = data->socket;
-    int client_id = data->client_id;
-    int read_size;
-    char client_message[BUFFER_SIZE];
-
-    while ((read_size = recv(sock, client_message, BUFFER_SIZE, 0)) > 0) {
-        client_message[read_size] = '\0';
-
-        // Print the received message for debugging
-        printf("Received message from client %d: %s\n", client_id + 1, client_message);
-
-        int sst, sd, normal_count, anomaly_count;
-        if (sscanf(client_message, "sst:%d,sd:%d,normal:%d,anomaly:%d", &sst, &sd, &normal_count, &anomaly_count) == 4) {
-            pthread_mutex_lock(&lock);
-            ue_data[client_id].sst = sst;
-            ue_data[client_id].sd = sd;
-            ue_data[client_id].normal_count = normal_count;
-            ue_data[client_id].anomaly_count = anomaly_count;
-            if (sd ==  1) {
-                ue_data[client_id].rrc_ue_id = 1;
-            }
-            else{
-                ue_data[client_id].rrc_ue_id = 2;
-            }
-            messages_received++;
-            if (messages_received == MAX_CLIENTS) {
-                pthread_cond_signal(&cond);
-            }
-            pthread_mutex_unlock(&lock);
-
-            // Print the parsed values for debugging
-            printf("Parsed values for client %d: SST: %d, SD: %d, Normal: %d, Anomaly: %d\n",
-                   client_id + 1, sst, sd, normal_count, anomaly_count);
-        } else {
-            printf("Failed to parse message from client %d: %s\n", client_id + 1, client_message);
-        }
-    }
-
-    if (read_size == 0) {
-        printf("Client %d disconnected\n", client_id + 1);
-        fflush(stdout);
-    } else if (read_size == -1) {
-        perror("recv failed");
-    }
-
-    free(client_data);
-    return 0;
-}
-
-// Function to execute RRC release command
+// Function to execute RRC release command in a separate thread
 void* rrc_release_ue_thread(void* arg) {
     int ran_ue_id = *((int*)arg);
     char command[256];
+    // Command sends 'rrc release_rrc <id>' to the controller/simulator
     snprintf(command, sizeof(command), "echo rrc release_rrc %d | nc %s 9090", ran_ue_id, SERVER_IP);
+    printf("Executing: %s\n", command);
     system(command);
     free(arg);
     return NULL;
 }
 
+// Spawns a detached thread to send the RRC release command
 void rrc_release_ue(int ran_ue_id) {
     pthread_t thread;
     int* arg = malloc(sizeof(*arg));
     if (arg) {
         *arg = ran_ue_id;
-        pthread_create(&thread, NULL, rrc_release_ue_thread, arg);
+        if (pthread_create(&thread, NULL, rrc_release_ue_thread, arg) != 0) {
+            perror("Failed to create RRC release thread");
+            free(arg);
+        }
         pthread_detach(thread);  // Detach the thread to avoid memory leaks
+    } else {
+        perror("Failed to malloc for RRC release thread");
     }
 }
 
+// Builds and sends the E2 control message to enforce slicing
 void enforce_slicing(e2_node_arr_xapp_t nodes) {
-    // Enforce slicing
+    // This function now reads the policy from the global ue_data state
     rc_ctrl_req_data_t rc_ctrl = {0};
     ue_id_e2sm_t ue_id = gen_rc_ue_id(GNB_UE_ID_E2SM);
+    
+    // Generate header
     rc_ctrl.hdr = gen_rc_ctrl_hdr(FORMAT_1_E2SM_RC_CTRL_HDR, ue_id, 2, Slice_level_PRB_quotal_7_6_3_1);
+    
+    // Generate message (which reads from global ue_data)
     rc_ctrl.msg = gen_rc_ctrl_msg(FORMAT_1_E2SM_RC_CTRL_MSG);
 
+    printf("Enforcing new policy:\n");
+    for(int i=0; i<MAX_CLIENTS; i++) {
+        printf("  - Slice (SST: %d, SD: %d) -> PRB: %d%%\n", ue_data[i].sst, ue_data[i].sd, ue_data[i].prb_allocation);
+    }
+
+    // Send control message to all connected E2 nodes
     for (size_t i = 0; i < nodes.len; ++i) {
         control_sm_xapp_api(&nodes.n[i].id, SM_RC_ID, &rc_ctrl);
     }
+    
+    // Free the complex data structures generated for the message
     free_rc_ctrl_req_data(&rc_ctrl);
 }
 
-void parse_and_apply_slicing(e2_node_arr_xapp_t nodes) {
-    int total_packets[MAX_CLIENTS];
-    double anomaly_ratios[MAX_CLIENTS];
-    int total_prb_allocation = 0;
-    int prb_allocation[MAX_CLIENTS];
-    int attacker_index = -1;
+// Polls the database for new messages and processes them
+void poll_and_process_messages(e2_node_arr_xapp_t nodes) {
+    sqlite3_stmt *select_stmt;
+    sqlite3_stmt *update_stmt;
+    
+    const char *sql_select = "SELECT id, sst, sd, anomaly_flag FROM messages WHERE status = 2 ORDER BY timestamp ASC;";
+    const char *sql_update = "UPDATE messages SET status = 3 WHERE id = ?;";
 
-    // Calculate anomaly ratios and tentative PRB allocations
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        total_packets[i] = ue_data[i].normal_count + ue_data[i].anomaly_count;
-        anomaly_ratios[i] = (total_packets[i] > 0) ? (double)ue_data[i].anomaly_count / total_packets[i] : 0;
-        prb_allocation[i] = (int)((1.0 - anomaly_ratios[i]) * 100);
-        total_prb_allocation += prb_allocation[i];
-        if (anomaly_ratios[i] == 1.0) {
-            // Anomaly ratio is 100%, mark as attacker
-            attacker_index = i;
-        }
+    // Prepare the SELECT statement
+    if (sqlite3_prepare_v2(db, sql_select, -1, &select_stmt, 0) != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare select statement: %s\n", sqlite3_errmsg(db));
+        return;
     }
 
-    if (attacker_index != -1) {
-        // Set PRB allocation to 0% for the attacker
-        prb_allocation[attacker_index] = 0;
-        ue_data[attacker_index].prb_allocation = 0;
+    bool policy_changed = false;
+    int processed_ids[256]; // Simple array to hold IDs of processed messages
+    int id_count = 0;
 
-        // Distribute remaining PRB among other UEs
-        total_prb_allocation = 0;
+    // Loop through all messages with status = 2
+    while (sqlite3_step(select_stmt) == SQLITE_ROW) {
+        int id = sqlite3_column_int(select_stmt, 0);
+        int sst = sqlite3_column_int(select_stmt, 1);
+        int sd = sqlite3_column_int(select_stmt, 2);
+        int anomaly_flag = sqlite3_column_int(select_stmt, 3);
+
+        // Find the corresponding slice in our state array
+        int ue_index = -1;
         for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (i != attacker_index) {
-                prb_allocation[i] = (int)((1.0 - anomaly_ratios[i]) * 100);
-                total_prb_allocation += prb_allocation[i];
+            if (ue_data[i].sst == sst && ue_data[i].sd == sd) {
+                ue_index = i;
+                break;
             }
         }
 
-        if (total_prb_allocation > 100) {
-            double scaling_factor = 100.0 / total_prb_allocation;
-            for (int i = 0; i < MAX_CLIENTS; i++) {
-                if (i != attacker_index) {
-                    prb_allocation[i] = (int)(prb_allocation[i] * scaling_factor);
+        if (ue_index == -1) {
+            fprintf(stderr, "Warning: Ignoring message for unknown slice (SST: %d, SD: %d)\n", sst, sd);
+            processed_ids[id_count++] = id; // Mark as processed even if unknown
+            continue;
+        }
+
+        // Determine new policy based on anomaly flag
+        int new_prb_allocation = (anomaly_flag == 1) ? 0 : 100;
+
+        // Check if this new policy is different from the current one
+        if (ue_data[ue_index].prb_allocation != new_prb_allocation) {
+            ue_data[ue_index].prb_allocation = new_prb_allocation;
+            policy_changed = true;
+            printf("Policy change for Slice (SST: %d, SD: %d): Set PRB to %d%%\n", sst, sd, new_prb_allocation);
+        }
+        
+        processed_ids[id_count++] = id; // Add to list of messages to update
+        if(id_count >= 256) break; // Avoid buffer overflow if too many messages
+    }
+    sqlite3_finalize(select_stmt);
+
+
+    // If any policy changed, enforce the new policies
+    if (policy_changed) {
+        // This sends the full list of policies (for all slices) to the E2 node
+        enforce_slicing(nodes);
+
+        // After enforcement, check if we need to RRC release anyone
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            // Check if the *newly enforced* policy is different from the *previous* one
+            if (ue_data[i].prb_allocation != ue_data[i].prev_prb_allocation) {
+                
+                // If the new policy is 0%, trigger RRC release
+                if (ue_data[i].prb_allocation == 0) {
+                    printf("Slice (SST: %d, SD: %d) identified as anomaly. Triggering RRC release for UE %d.\n",
+                           ue_data[i].sst, ue_data[i].sd, ue_data[i].rrc_ue_id);
+                    rrc_release_ue(ue_data[i].rrc_ue_id);
                 }
-            }
-        }
-
-        // Apply new PRB allocations before RRC release
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (i != attacker_index) {
-                if (prb_allocation[i] < ue_data[i].prev_prb_allocation) {
-                    ue_data[i].prb_allocation = prb_allocation[i];
-                    enforce_slicing(nodes);
-                    ue_data[i].prev_prb_allocation = ue_data[i].prb_allocation;
-                }
-            }
-        }
-
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (i != attacker_index) {
-                if (prb_allocation[i] > ue_data[i].prev_prb_allocation) {
-                    ue_data[i].prb_allocation = prb_allocation[i];
-                    enforce_slicing(nodes);
-                    ue_data[i].prev_prb_allocation = ue_data[i].prb_allocation;
-                }
-            }
-        }
-
-        // Trigger RRC release for the attacker
-        printf("Client %d (RAN UE ID: %d) has 100%% anomaly. Triggering RRC release.\n", attacker_index + 1, ue_data[attacker_index].rrc_ue_id);
-        rrc_release_ue(ue_data[attacker_index].rrc_ue_id);
-    } else {
-        // Adjust PRB allocations to ensure the total does not exceed 100%
-        if (total_prb_allocation > 100) {
-            double scaling_factor = 100.0 / total_prb_allocation;
-            for (int i = 0; i < MAX_CLIENTS; i++) {
-                prb_allocation[i] = (int)(prb_allocation[i] * scaling_factor);
-            }
-        }
-
-        // Apply slicing changes
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (prb_allocation[i] < ue_data[i].prev_prb_allocation) {
-                ue_data[i].prb_allocation = prb_allocation[i];
-                enforce_slicing(nodes);
-                ue_data[i].prev_prb_allocation = ue_data[i].prb_allocation;
-            }
-        }
-
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (prb_allocation[i] > ue_data[i].prev_prb_allocation) {
-                ue_data[i].prb_allocation = prb_allocation[i];
-                enforce_slicing(nodes);
+                
+                // Update the previous allocation to match the new one
                 ue_data[i].prev_prb_allocation = ue_data[i].prb_allocation;
             }
         }
     }
 
-    // Print the final allocations
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        printf("Client %d (SST: %d, SD: %d) PRB allocation: %d%%\n", i + 1, ue_data[i].sst, ue_data[i].sd, ue_data[i].prb_allocation);
+    // Now, update the status of all processed messages in the database
+    if (id_count > 0) {
+        printf("Processing %d messages from database...\n", id_count);
+        // Prepare the UPDATE statement
+        if (sqlite3_prepare_v2(db, sql_update, -1, &update_stmt, 0) != SQLITE_OK) {
+            fprintf(stderr, "Failed to prepare update statement: %s\n", sqlite3_errmsg(db));
+            return;
+        }
+        
+        for (int i = 0; i < id_count; i++) {
+            sqlite3_bind_int(update_stmt, 1, processed_ids[i]);
+            if (sqlite3_step(update_stmt) != SQLITE_DONE) {
+                fprintf(stderr, "Failed to update message ID %d: %s\n", processed_ids[i], sqlite3_errmsg(db));
+            }
+            sqlite3_reset(update_stmt); // Reset for next iteration
+        }
+        sqlite3_finalize(update_stmt);
+        printf("Finished processing %d messages.\n", id_count);
     }
 }
 
 
-
 int main(int argc, char *argv[]) {
-    int socket_desc, new_socket, c;
-    struct sockaddr_in server, client;
-    int opt = 1;
+    char *err_msg = 0;
 
-    // Initialize mutex and condition variable
-    pthread_mutex_init(&lock, NULL);
-    pthread_cond_init(&cond, NULL);
-
-    // Initialize ue_data with default SST and SD values
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        ue_data[i].sst = (i == 0) ? 1 : 1;
-        ue_data[i].sd = (i == 0) ? 1 : 5;
-        ue_data[i].normal_count = 0;
-        ue_data[i].anomaly_count = 0;
-        ue_data[i].prb_allocation = 0;
-        ue_data[i].prev_prb_allocation = 0;
+    // --- Initialize SQLite Database ---
+    if (sqlite3_open(DB_PATH, &db) != SQLITE_OK) {
+        fprintf(stderr, "Cannot open database: %s\n", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return 1;
     }
+    puts("Database opened successfully.");
 
+    // Create the table as requested if it doesn't exist
+    const char *sql_create_table = 
+        "CREATE TABLE IF NOT EXISTS messages ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "sst INTEGER NOT NULL,"
+        "sd INTEGER NOT NULL,"
+        "data BLOB NOT NULL,"
+        "anomaly_flag INTEGER,"
+        "status INTEGER NOT NULL,"
+        "timestamp DATETIME DEFAULT CURRENT_TIMESTAMP"
+        ");";
+
+    if (sqlite3_exec(db, sql_create_table, 0, 0, &err_msg) != SQLITE_OK) {
+        fprintf(stderr, "Failed to create table: %s\n", err_msg);
+        sqlite3_free(err_msg);
+        sqlite3_close(db);
+        return 1;
+    }
+    puts("Table 'messages' is ready.");
+
+
+    // --- Initialize xApp ---
     fr_args_t args = init_fr_args(argc, argv);
     //defer({ free_fr_args(&args); });
 
@@ -526,76 +503,30 @@ int main(int argc, char *argv[]) {
 
     e2_node_arr_xapp_t nodes = e2_nodes_xapp_api();
     defer({ free_e2_node_arr_xapp(&nodes); });
-    assert(nodes.len > 0);
+    if (nodes.len == 0) {
+        fprintf(stderr, "No E2 nodes connected. Exiting.\n");
+        sqlite3_close(db);
+        return 1;
+    }
     printf("Connected E2 nodes = %d\n", nodes.len);
 
-    // Create socket
-    socket_desc = socket(AF_INET, SOCK_STREAM, 0);
-    if (socket_desc == -1) {
-        printf("Could not create socket");
-        return 1;
-    }
-    puts("Socket created");
 
-    // Set the socket options
-    if (setsockopt(socket_desc, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
-        perror("setsockopt failed");
-        return 1;
-    }
+    // --- Initialize Slice State ---
+    // This xApp is hardcoded to manage two specific slices
+    // Slice 1: SST=1, SD=1
+    ue_data[0].sst = 1;
+    ue_data[0].sd = 1;
+    ue_data[0].prb_allocation = 50; // Default to 50%
+    ue_data[0].prev_prb_allocation = 50;
+    ue_data[0].rrc_ue_id = 1; // Mapped UE ID for RRC release
 
-    // Prepare the sockaddr_in structure
-    server.sin_family = AF_INET;
-    server.sin_addr.s_addr = inet_addr(SERVER_IP); // Use defined IP address
-    server.sin_port = htons(PORT);
-
-    // Bind
-    if (bind(socket_desc, (struct sockaddr *)&server, sizeof(server)) < 0) {
-        perror("Bind failed. Error");
-        return 1;
-    }
-    puts("Bind done");
-
-    // Listen
-    listen(socket_desc, MAX_CLIENTS);
-
-    // Accept incoming connections
-    puts("Waiting for incoming connections...");
-    c = sizeof(struct sockaddr_in);
-
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        new_socket = accept(socket_desc, (struct sockaddr *)&client, (socklen_t*)&c);
-        if (new_socket < 0) {
-            perror("Accept failed");
-            return 1;
-        }
-        printf("Connection accepted from client %d\n", i + 1);
-
-        client_data_t *client_data = (client_data_t*)malloc(sizeof(client_data_t));
-        client_data->socket = new_socket;
-        client_data->client_id = i;
-
-        pthread_mutex_lock(&lock);
-        clients_connected++;
-        pthread_cond_signal(&cond);
-        pthread_mutex_unlock(&lock);
-
-        pthread_t sniffer_thread;
-        if (pthread_create(&sniffer_thread, NULL, client_handler, (void*)client_data) < 0) {
-            perror("could not create thread");
-            return 1;
-        }
-
-        pthread_detach(sniffer_thread);
-    }
-
-    // Wait until both clients are connected
-    pthread_mutex_lock(&lock);
-    while (clients_connected < MAX_CLIENTS) {
-        pthread_cond_wait(&cond, &lock);
-    }
-    pthread_mutex_unlock(&lock);
-
-    puts("Both clients connected. Starting main loop...");
+    // Slice 2: SST=1, SD=5
+    ue_data[1].sst = 1;
+    ue_data[1].sd = 5;
+    ue_data[1].prb_allocation = 50; // Default to 50%
+    ue_data[1].prev_prb_allocation = 50;
+    ue_data[1].rrc_ue_id = 2; // Mapped UE ID for RRC release
+    
 
     ////////////
     // START RC
@@ -606,58 +537,29 @@ int main(int argc, char *argv[]) {
     // Action ID 6: Slice-level PRB quota
     // E2SM-RC Control Header Format 1
     // E2SM-RC Control Message Format 1
-    rc_ctrl_req_data_t rc_ctrl = {0};
-    ue_id_e2sm_t ue_id = gen_rc_ue_id(GNB_UE_ID_E2SM);
-
-        // Initial dummy allocation
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        ue_data[i].sst = 1;
-        ue_data[i].sd = (i == 0) ? 1 : 5;
-        ue_data[i].prb_allocation = 50; // Default to 50% allocation
-        ue_data[i].prev_prb_allocation = 50;
-    }
-
-    rc_ctrl.hdr = gen_rc_ctrl_hdr(FORMAT_1_E2SM_RC_CTRL_HDR, ue_id, 2, Slice_level_PRB_quotal_7_6_3_1);
-    rc_ctrl.msg = gen_rc_ctrl_msg(FORMAT_1_E2SM_RC_CTRL_MSG);
-
     
-    for (size_t i = 0; i < nodes.len; ++i) {
-              control_sm_xapp_api(&nodes.n[i].id, SM_RC_ID, &rc_ctrl);
-    }
-    free_rc_ctrl_req_data(&rc_ctrl);
+    // Send initial default allocation (50/50)
+    puts("Sending initial 50/50 PRB allocation...");
+    enforce_slicing(nodes);
     puts("RC initialization completed. Starting main loop...");
 
-    // Main loop to process messages
-    while (1) {
-        pthread_mutex_lock(&lock);
-        while (messages_received < MAX_CLIENTS) {
-            pthread_cond_wait(&cond, &lock);
-        }
-        // Print received messages
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            printf("Client %d: SST: %d, SD: %d, Normal: %d, Anomaly: %d\n",
-                   i + 1, ue_data[i].sst, ue_data[i].sd, ue_data[i].normal_count, ue_data[i].anomaly_count);
-        }
-
-        // Parse and apply slicing based on received messages
-        parse_and_apply_slicing(nodes);
-
-        messages_received = 0;
-        pthread_mutex_unlock(&lock);
+    // --- Main loop ---
+    // This loop periodically polls the database for new messages
+    while (try_stop_xapp_api() == false) {
+        poll_and_process_messages(nodes);
+        usleep(POLLING_INTERVAL_US); // Wait for the next polling interval
     }
 
-    // Cleanup and close sockets
-    close(socket_desc);
-    pthread_mutex_destroy(&lock);
-    pthread_cond_destroy(&cond);
+    // --- Cleanup ---
+    sqlite3_close(db);
+    puts("Database closed.");
+    
+    ////////////
+    // END RC
+    ////////////
 
-  ////////////
-  // END RC
-  ////////////
+    //Stop the xApp (already handled by while loop condition)
+    puts("Stopping xApp...");
 
-  //Stop the xApp
-  while(try_stop_xapp_api() == false)
-    usleep(1000);
-
-  return 0;
+    return 0;
 }
