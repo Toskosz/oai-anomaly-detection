@@ -27,7 +27,7 @@ def predict(fhe_server, keys, row_id, encrypted_input):
         with sqlite3.connect(DB_NAME) as conn:
             conn.execute("""
                 UPDATE messages
-                SET data = ?,
+                SET encrypted_prediction_result = ?,
                     status = 1
                 WHERE id = ?
             """, (serialized_encrypted_output, row_id))
@@ -55,7 +55,7 @@ def main():
                         cursor = conn.cursor()
                         cursor.execute("""
                             SELECT id,
-                                data
+                                encrypted_input
                             FROM messages
                             WHERE status = 0
                             ORDER BY timestamp
@@ -72,6 +72,7 @@ def main():
                     predict(fhe_server, serialized_evaluation_keys, row_to_process["id"], row_to_process["data"])
                 except Exception as e:
                     print(f"[ERROR] Failed during job processing for {row_to_process['id']}: {e}")
+                    raise
             else:
                 time.sleep(POLLING_INTERVAL)
 

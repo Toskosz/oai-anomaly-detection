@@ -31,7 +31,8 @@ def setup_database(db_name):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 sst INTEGER NOT NULL,
                 sd INTEGER NOT NULL,
-                data BLOB NOT NULL,
+                encrypted_input BLOB,
+                encrypted_prediction_result BLOB,
                 anomaly_percentage REAL,
                 status INTEGER NOT NULL,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -89,7 +90,7 @@ def send_cipher_to_xapp(flow_data_json, fhe_client, conn):
         try:
             print(f"[DB_WRITE_TO_XAPP] Writing upf data to database.")
             conn.execute("""
-                INSERT INTO messages (sst, sd, data, status) 
+                INSERT INTO messages (sst, sd, encrypted_input, status) 
                 VALUES (?, ?, ?, 0)
             """, (sst, sd, encrypted_input))
             conn.commit()
@@ -145,7 +146,7 @@ def listen_to_xapp(fhe_client):
                         SELECT id,
                             sst,
                             sd,
-                            data
+                            encrypted_input
                         FROM messages
                         WHERE status = 1
                         ORDER BY timestamp
