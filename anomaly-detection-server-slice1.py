@@ -1,19 +1,5 @@
-# AI-Driven Anomaly Detection Server (ADS) for O-RAN 5G Slicing
-#
-# Author: Based on the research by Tsourdinis et al.
-# Paper: "AI-Driven Network Intrusion Detection and Resource Allocation in Real-World O-RAN 5G Networks"
-#
-# This script is designed to run within the custom UPF Docker container.
-# Its purpose is to:
-# 1. Capture de-encapsulated user traffic in real-time.
-# 2. Extract specific features from each packet.
-# 2.1 Encrypt
-# 2,2 Send to rApp
-# 3. Use Random Forest model to classify traffic.
-# 3.1 Send result back to "upf"
-# 3.2 UPF Decrypts and sends result to rapp
-# 5. Report the anomaly percentage for each user to the control xApp over a TCP socket.
 
+import json
 import socket
 import pandas as pd
 from scapy.layers.inet import *
@@ -29,7 +15,7 @@ XAPP_HOST = '192.168.70.1'    # IP of the machine running the RIC/xApp (likely t
 XAPP_PORT = 8080              # Arbitrary port for communication with the xApp
 CAPTURE_INTERFACE = "eth0"    # Interface inside the UPF container that sees the de-tunneled user traffic
 WINDOW_SIZE = 10              # Number of packets to analyze per user before sending a report
-PREPROCESSOR_PATH = ''
+PREPROCESSOR_PATH = './preprocessor.pkl'
 
 # --- LOAD PRE-TRAINED ML COMPONENTS ---
 # These must be loaded once at the start for efficiency.
@@ -60,30 +46,24 @@ packet_count = 0
 
 
 def extract_features(packet):
-    """
-    Extracts the 5 key features from a Scapy packet as required by the ML model.
-    This function assumes it's being passed the *inner* IP packet (after GTP de-tunneling).
-    """
     if not packet.haslayer(IP):
         return None
 
-    if packet_count == 0:
-        # 1. Get Protocol
-        if packet.haslayer(TCP):
-            flow_data['protocol_type'] = 'tcp'
-            proto_layer = packet[TCP]
-        elif packet.haslayer(UDP):
-            flow_data['protocol_type'] = 'udp'
-            proto_layer = packet[UDP]
-        elif packet.haslayer(ICMP):
-            flow_data['protocol_type'] = 'icmp'
-            proto_layer = packet[ICMP]
-        else:
-            return None # We only care about TCP, UDP, ICMP for this model
+    if packet.haslayer(TCP):
+        flow_data['protocol_type'] = 'tcp'
+        proto_layer = packet[TCP]
+    elif packet.haslayer(UDP):
+        flow_data['protocol_type'] = 'udp'
+        proto_layer = packet[UDP]
+    elif packet.haslayer(ICMP):
+        flow_data['protocol_type'] = 'icmp'
+        proto_layer = packet[ICMP]
+    else:
+        return None # We only care about TCP, UDP, ICMP for this model
 
-        # 2. Get Service (from destination port)
-        if hasattr(proto_layer, 'dport'):
-            flow_data['service'] = PORT_TO_SERVICE.get(proto_layer.dport, 'other')
+    # 2. Get Service (from destination port)
+    if hasattr(proto_layer, 'dport'):
+        flow_data['service'] = PORT_TO_SERVICE.get(proto_layer.dport, 'other')
 
     # 4 & 5. Get Bytes (payload size)
     # Traffic from UE (e.g. 12.2.1.2 -> 12.2.1.1) is 'src_bytes'
@@ -97,26 +77,23 @@ def extract_features(packet):
 
 # --- MAIN PACKET PROCESSING AND ML INFERENCE ---
 def preprocess():
-    """
-    Takes a full window of traffic for a UE and preprocesses it.
-    """
 
-    df = pd.DataFrame(flow_data)
+    df = pd.DataFrame([flow_data])
     X_processed = preprocessor.transform(df).toarray()
 
     return X_processed
 
 def packet_handler(packet):
-    """
-    This is the callback function called by Scapy's sniff() for each captured packet.
-    It manages the sliding window and triggers the prediction and reporting.
-    """
     # We expect GTP-U encapsulated traffic. The inner packet has the UE's IP.
     if not packet.haslayer(GTP_U_Header) or not packet[GTP_U_Header].haslayer(IP):
         return
 
     inner_ip_packet = packet[GTP_U_Header][IP]
     extract_features(inner_ip_packet)
+
+    global packet_count
+
+    packet_count = packet_count + 1
 
     # If window is full, process and report
     if packet_count >= WINDOW_SIZE:
