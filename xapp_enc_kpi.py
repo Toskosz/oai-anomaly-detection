@@ -146,7 +146,7 @@ def listen_to_xapp(fhe_client):
                         SELECT id,
                             sst,
                             sd,
-                            encrypted_input
+                            encrypted_prediction_result
                         FROM messages
                         WHERE status = 1
                         ORDER BY timestamp
@@ -160,7 +160,7 @@ def listen_to_xapp(fhe_client):
                 print(f"[DB_RECV_FROM_XAPP] Found job id {row_to_process['id']}. Setting to 'pending'.")
                 try:
                     decipher_model_response(
-                        bytes(row_to_process['data']), 
+                        bytes(row_to_process['encrypted_prediction_result']), 
                         conn,
                         row_to_process['id'], 
                         fhe_client
