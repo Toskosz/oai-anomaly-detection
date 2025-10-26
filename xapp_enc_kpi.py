@@ -32,7 +32,7 @@ def setup_database(db_name):
                 sst INTEGER NOT NULL,
                 sd INTEGER NOT NULL,
                 data BLOB NOT NULL,
-                anomaly_flag INTEGER,
+                anomaly_percentage REAL,
                 status INTEGER NOT NULL,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
@@ -58,31 +58,18 @@ def decipher_model_response(encrypted_data, db_name, row_id, fhe_client):
     print(f"[DB_RECV] Processing job {row_id} with {len(encrypted_data)} encrypted bytes from DB.")
     try:
         result = fhe_client.deserialize_decrypt_dequantize(encrypted_data)
-        prediction = 1 if result[0][1] > 0.5 else 0
 
-        if prediction == 1:
-            try:
-                with sqlite3.connect(db_name) as conn:
-                    conn.execute("""
-                        UPDATE messages
-                        SET anomaly_flag = 1,
-                            status = 2
-                        WHERE id = ?
-                    """, (row_id))
-                    conn.commit()
-            except Exception as e:
-                print(f"[ERROR] Failed to write to 'predictions' table for job {row_id}: {e}")
-        else:
-            print(f"[INFO] Job {row_id} is NORMAL ({result[0][1]}). Deleting prediction from DB.")
-            try:
-                with sqlite3.connect(db_name) as conn:
-                    conn.execute("""
-                        DELETE from messages
-                        WHERE id = ?
-                    """, (row_id))
-                    conn.commit()
-            except Exception as e:
-                print(f"[ERROR] Failed to write to 'predictions' table for job {row_id}: {e}")
+        try:
+            with sqlite3.connect(db_name) as conn:
+                conn.execute("""
+                    UPDATE messages
+                    SET anomaly_percentage = ?,
+                        status = 2
+                    WHERE id = ?
+                """, (result[0][1], row_id))
+                conn.commit()
+        except Exception as e:
+            print(f"[ERROR] Failed to write prediction result for job {row_id}: {e}")
     except Exception as e:
         print(f"[ERROR] Failed to decrypt message from xApp: {e}")
 
