@@ -408,6 +408,27 @@ void poll_and_process_messages(e2_node_arr_xapp_t nodes) {
 
     // If any policy changed, enforce the new policies
     if (policy_changed) {
+
+	int total_prb_allocation = 0;
+        int attacker_index = -1;
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            total_prb_allocation += ue_data[i].prb_allocation;
+            if (ue_data[i].prb_allocation == 0) {
+                attacker_index = i;
+            }
+        }
+
+	// Don't scale if there's an attacker (let them be 0)
+        // Only scale if there's no attacker AND total is over 100
+        if (total_prb_allocation > 100 && attacker_index == -1) {
+            printf("Total PRB (%d%%) > 100%%. Scaling down...\n", total_prb_allocation);
+            double scaling_factor = 100.0 / total_prb_allocation;
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                ue_data[i].prb_allocation = (int)(ue_data[i].prb_allocation * scaling_factor);
+            }
+        }
+
+
         // This sends the full list of policies (for all slices) to the E2 node
         enforce_slicing(nodes);
 
@@ -415,14 +436,14 @@ void poll_and_process_messages(e2_node_arr_xapp_t nodes) {
         for (int i = 0; i < MAX_CLIENTS; i++) {
             // Check if the *newly enforced* policy is different from the *previous* one
             if (ue_data[i].prb_allocation != ue_data[i].prev_prb_allocation) {
-                
+
                 // If the new policy is 0%, trigger RRC release
                 if (ue_data[i].prb_allocation == 0) {
                     printf("Slice (SST: %d, SD: %d) identified as anomaly. Triggering RRC release for UE %d.\n",
                            ue_data[i].sst, ue_data[i].sd, ue_data[i].rrc_ue_id);
                     rrc_release_ue(ue_data[i].rrc_ue_id);
                 }
-                
+
                 // Update the previous allocation to match the new one
                 ue_data[i].prev_prb_allocation = ue_data[i].prb_allocation;
             }
