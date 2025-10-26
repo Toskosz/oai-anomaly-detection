@@ -54,26 +54,26 @@ def load_fhe_client():
         print(f"[ERROR] Could not load FHE model: {e}")
         sys.exit(1)
 
-def decipher_model_response(encrypted_data, db_name, row_id, fhe_client):
+def decipher_model_response(encrypted_data, conn, row_id, fhe_client):
     print(f"[DB_RECV] Processing job {row_id} with {len(encrypted_data)} encrypted bytes from DB.")
     try:
         result = fhe_client.deserialize_decrypt_dequantize(encrypted_data)
 
         try:
-            with sqlite3.connect(db_name) as conn:
-                conn.execute("""
-                    UPDATE messages
-                    SET anomaly_percentage = ?,
-                        status = 2
-                    WHERE id = ?
-                """, (result[0][1], row_id))
-                conn.commit()
+            conn.execute("""
+                UPDATE messages
+                SET anomaly_percentage = ?,
+                    status = 2
+                WHERE id = ?
+            """, (result[0][1], row_id))
+            conn.commit()
         except Exception as e:
             print(f"[ERROR] Failed to write prediction result for job {row_id}: {e}")
     except Exception as e:
         print(f"[ERROR] Failed to decrypt message from xApp: {e}")
+        raise
 
-def send_cipher_to_xapp(flow_data_json, fhe_client, db_name):
+def send_cipher_to_xapp(flow_data_json, fhe_client, conn):
     print(f"[UPF_RECV] Received from UPF: {flow_data_json[:70]}...") # Log truncated message
     
     try:
@@ -88,12 +88,11 @@ def send_cipher_to_xapp(flow_data_json, fhe_client, db_name):
 
         try:
             print(f"[DB_WRITE_TO_XAPP] Writing upf data to database.")
-            with sqlite3.connect(db_name) as conn:
-                conn.execute("""
-                    INSERT INTO messages (sst, sd, data, status) 
-                    VALUES (?, ?, ?, 0)
-                """, (sst, sd, encrypted_input))
-                conn.commit()
+            conn.execute("""
+                INSERT INTO messages (sst, sd, data, status) 
+                VALUES (?, ?, ?, 0)
+            """, (sst, sd, encrypted_input))
+            conn.commit()
         except Exception as e:
             print(f"[ERROR] Failed to write message to database for xApp: {e}")
 
@@ -107,61 +106,67 @@ def send_cipher_to_xapp(flow_data_json, fhe_client, db_name):
         print(f"[ERROR] Error in FHE processing (function_Y): {e}")
         return
 
-def listen_to_upf(upf_conn, fhe_client, db_name):
+def listen_to_upf(upf_conn, fhe_client):
     print("[INFO] UPF listener thread started.")
+    conn = None
     try:
+        conn = sqlite3.connect(DB_NAME)
         with upf_conn, upf_conn.makefile('r') as fileobj:
             while True:
                 line = fileobj.readline()
                 if not line:
                     print("[INFO] UPF disconnected.")
                     break
-                send_cipher_to_xapp(line.strip(), fhe_client, db_name)
+                send_cipher_to_xapp(line.strip(), fhe_client, conn)
 
     except (IOError, socket.error) as e:
         print(f"[INFO] UPF connection error: {e}")
     except Exception as e:
         print(f"[ERROR] Unhandled error in UPF listener: {e}")
     finally:
+        if conn:
+            conn.close()
         print("[INFO] UPF listener thread stopped.")
 
-def listen_to_xapp(db_name, fhe_client):
+def listen_to_xapp(fhe_client):
     """Worker thread to listen for messages from xApp."""
     print("[INFO] xApp listener thread started.")
+    conn = None
     try:
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+
         while True:
             row_to_process = None
             try:
-                with sqlite3.connect(db_name) as conn:
-                    conn.row_factory = sqlite3.Row
-                    with conn:
-                        cursor = conn.cursor()
-                        cursor.execute("""
-                            SELECT id,
-                                sst,
-                                sd,
-                                data
-                            FROM messages
-                            WHERE status = 1
-                            ORDER BY timestamp
-                            LIMIT 1
-                        """)
-                        row_to_process = cursor.fetchone()
-                        if row_to_process:
-                            print(f"[DB_RECV_FROM_XAPP] Found job id {row_to_process['id']}. Setting to 'pending'.")
+                with conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT id,
+                            sst,
+                            sd,
+                            data
+                        FROM messages
+                        WHERE status = 1
+                        ORDER BY timestamp
+                        LIMIT 1
+                    """)
+                    row_to_process = cursor.fetchone()
             except sqlite3.Error as e:
                 print(f"[ERROR] DB transaction error in KPI xApp: {e}")
 
             if row_to_process:
+                print(f"[DB_RECV_FROM_XAPP] Found job id {row_to_process['id']}. Setting to 'pending'.")
                 try:
                     decipher_model_response(
                         bytes(row_to_process['data']), 
-                        db_name,
+                        conn,
                         row_to_process['id'], 
                         fhe_client
                     )
                 except Exception as e:
                     print(f"[ERROR] Failed during job processing for {row_to_process['id']}: {e}")
+                    raise
             else:
                 time.sleep(POLLING_INTERVAL)
 
@@ -170,6 +175,8 @@ def listen_to_xapp(db_name, fhe_client):
     except Exception as e:
         print(f"[ERROR] Unhandled error in xApp listener: {e}")
     finally:
+        if conn:
+            conn.close()
         print("[INFO] xApp listener thread stopped.")
 
 
@@ -196,8 +203,8 @@ def main():
         print(f"[INFO] UPF connected from {addr}")
 
         # 3. Start listener threads for both connections
-        upf_thread = threading.Thread(target=listen_to_upf, args=(upf_conn, fhe_client, DB_NAME))
-        xapp_thread = threading.Thread(target=listen_to_xapp, args=(DB_NAME, fhe_client))
+        upf_thread = threading.Thread(target=listen_to_upf, args=(upf_conn, fhe_client,))
+        xapp_thread = threading.Thread(target=listen_to_xapp, args=(fhe_client, ))
         
         upf_thread.daemon = True
         xapp_thread.daemon = True
@@ -225,7 +232,7 @@ def main():
             upf_thread.join(1)
         if xapp_thread and xapp_thread.is_alive():
             xapp_thread.join(1)
-            
+
         print("[INFO] Shutdown complete.")
 
 if __name__ == "__main__":
