@@ -365,7 +365,7 @@ void poll_and_process_messages(e2_node_arr_xapp_t nodes) {
     sqlite3_stmt *select_stmt;
     sqlite3_stmt *update_stmt;
     
-    const char *sql_select = "SELECT id, sst, sd, anomaly_flag FROM messages WHERE status = 2 ORDER BY timestamp ASC;";
+    const char *sql_select = "SELECT id, sst, sd, anomaly_percentage FROM messages WHERE status = 2 ORDER BY timestamp ASC;";
     const char *sql_update = "UPDATE messages SET status = 3 WHERE id = ?;";
 
     // Prepare the SELECT statement
@@ -383,7 +383,7 @@ void poll_and_process_messages(e2_node_arr_xapp_t nodes) {
         int id = sqlite3_column_int(select_stmt, 0);
         int sst = sqlite3_column_int(select_stmt, 1);
         int sd = sqlite3_column_int(select_stmt, 2);
-        int anomaly_flag = sqlite3_column_int(select_stmt, 3);
+        int anomaly_percentage = sqlite3_column_double(select_stmt, 3);
 
         // Find the corresponding slice in our state array
         int ue_index = -1;
@@ -401,7 +401,7 @@ void poll_and_process_messages(e2_node_arr_xapp_t nodes) {
         }
 
         // Determine new policy based on anomaly flag
-        int new_prb_allocation = (anomaly_flag == 1) ? 0 : 100;
+        int new_prb_allocation = (anomaly_percentage >= 0.95) ? 0 : (int)((1.0 - anomaly_percentage) * 100)
 
         // Check if this new policy is different from the current one
         if (ue_data[ue_index].prb_allocation != new_prb_allocation) {
@@ -479,7 +479,7 @@ int main(int argc, char *argv[]) {
         "sst INTEGER NOT NULL,"
         "sd INTEGER NOT NULL,"
         "data BLOB NOT NULL,"
-        "anomaly_flag INTEGER,"
+        "anomaly_percentage REAL,"
         "status INTEGER NOT NULL,"
         "timestamp DATETIME DEFAULT CURRENT_TIMESTAMP"
         ");";
