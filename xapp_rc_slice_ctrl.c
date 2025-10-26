@@ -54,6 +54,8 @@ typedef struct {
 
 ue_data_t ue_data[MAX_CLIENTS];
 sqlite3 *db; // SQLite database handle
+sqlite3_stmt *select_stmt; // Prepared SELECT statement
+sqlite3_stmt *update_stmt; // Prepared UPDATE statement
 
 typedef enum{
     DRX_parameter_configuration_7_6_3_1 = 1,
@@ -362,17 +364,6 @@ void enforce_slicing(e2_node_arr_xapp_t nodes) {
 
 // Polls the database for new messages and processes them
 void poll_and_process_messages(e2_node_arr_xapp_t nodes) {
-    sqlite3_stmt *select_stmt;
-    sqlite3_stmt *update_stmt;
-    
-    const char *sql_select = "SELECT id, sst, sd, anomaly_percentage FROM messages WHERE status = 2 ORDER BY timestamp ASC;";
-    const char *sql_update = "UPDATE messages SET status = 3 WHERE id = ?;";
-
-    // Prepare the SELECT statement
-    if (sqlite3_prepare_v2(db, sql_select, -1, &select_stmt, 0) != SQLITE_OK) {
-        fprintf(stderr, "Failed to prepare select statement: %s\n", sqlite3_errmsg(db));
-        return;
-    }
 
     bool policy_changed = false;
     int processed_ids[256]; // Simple array to hold IDs of processed messages
@@ -413,8 +404,7 @@ void poll_and_process_messages(e2_node_arr_xapp_t nodes) {
         processed_ids[id_count++] = id; // Add to list of messages to update
         if(id_count >= 256) break; // Avoid buffer overflow if too many messages
     }
-    sqlite3_finalize(select_stmt);
-
+    sqlite3_reset(select_stmt);
 
     // If any policy changed, enforce the new policies
     if (policy_changed) {
@@ -442,12 +432,7 @@ void poll_and_process_messages(e2_node_arr_xapp_t nodes) {
     // Now, update the status of all processed messages in the database
     if (id_count > 0) {
         printf("Processing %d messages from database...\n", id_count);
-        // Prepare the UPDATE statement
-        if (sqlite3_prepare_v2(db, sql_update, -1, &update_stmt, 0) != SQLITE_OK) {
-            fprintf(stderr, "Failed to prepare update statement: %s\n", sqlite3_errmsg(db));
-            return;
-        }
-        
+
         for (int i = 0; i < id_count; i++) {
             sqlite3_bind_int(update_stmt, 1, processed_ids[i]);
             if (sqlite3_step(update_stmt) != SQLITE_DONE) {
@@ -455,7 +440,6 @@ void poll_and_process_messages(e2_node_arr_xapp_t nodes) {
             }
             sqlite3_reset(update_stmt); // Reset for next iteration
         }
-        sqlite3_finalize(update_stmt);
         printf("Finished processing %d messages.\n", id_count);
     }
 }
@@ -493,6 +477,22 @@ int main(int argc, char *argv[]) {
     }
     puts("Table 'messages' is ready.");
 
+    // --- Prepare SQL statements ONCE ---
+    const char *sql_select = "SELECT id, sst, sd, anomaly_percentage FROM messages WHERE status = 2 ORDER BY timestamp ASC;";
+    if (sqlite3_prepare_v2(db, sql_select, -1, &select_stmt, 0) != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare select statement: %s\n", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return 1;
+    }
+
+    const char *sql_update = "UPDATE messages SET status = 3 WHERE id = ?;";
+    if (sqlite3_prepare_v2(db, sql_update, -1, &update_stmt, 0) != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare update statement: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(select_stmt); // Clean up the one that succeeded
+        sqlite3_close(db);
+        return 1;
+    }
+    puts("SQL statements prepared successfully.");
 
     // --- Initialize xApp ---
     fr_args_t args = init_fr_args(argc, argv);
@@ -552,9 +552,12 @@ int main(int argc, char *argv[]) {
     }
 
     // --- Cleanup ---
+    sqlite3_finalize(select_stmt);
+    sqlite3_finalize(update_stmt);
+    puts("Prepared statements finalized.");
     sqlite3_close(db);
     puts("Database closed.");
-    
+
     ////////////
     // END RC
     ////////////
