@@ -392,7 +392,7 @@ void poll_and_process_messages(e2_node_arr_xapp_t nodes) {
         }
 
         // Determine new policy based on anomaly flag
-        int new_prb_allocation = (anomaly_percentage >= 0.95) ? 0 : (int)((1.0 - anomaly_percentage) * 100)
+        int new_prb_allocation = (anomaly_percentage >= 0.95) ? 0 : (int)((1.0 - anomaly_percentage) * 100);
 
         // Check if this new policy is different from the current one
         if (ue_data[ue_index].prb_allocation != new_prb_allocation) {
