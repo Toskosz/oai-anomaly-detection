@@ -45,6 +45,7 @@ def main():
 
     print("[INFO] FHE server loaded.")
 
+    print("[INFERENCE XAPP] xApp worker started. Polling database...")
     try:
         while True:
             row_to_process = None
@@ -69,11 +70,12 @@ def main():
 
             if row_to_process:
                 try:
-                    predict(fhe_server, serialized_evaluation_keys, row_to_process["id"], row_to_process["data"])
+                    predict(fhe_server, serialized_evaluation_keys, row_to_process["id"], row_to_process["encrypted_input"])
                 except Exception as e:
                     print(f"[ERROR] Failed during job processing for {row_to_process['id']}: {e}")
                     raise
             else:
+                print("[INFERENCE XAPP] No jobs found. Waiting...")
                 time.sleep(POLLING_INTERVAL)
 
     except sqlite3.Error as e:
@@ -81,3 +83,5 @@ def main():
     except Exception as e:
         print(f"[ERROR] Unhandled error in Inference xApp: {e}")
 
+if __name__ == "__main__":
+    main()
