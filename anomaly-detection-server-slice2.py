@@ -1,6 +1,6 @@
+
 import json
 import socket
-import pandas as pd
 from scapy.layers.inet import *
 from scapy.all import *
 from scapy.contrib.gtp import GTP_U_Header
@@ -12,20 +12,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # --- CONFIGURATION ---
 XAPP_HOST = '192.168.70.1'    # IP of the machine running the RIC/xApp (likely the AMF's IP in this setup)
 XAPP_PORT = 8080              # Arbitrary port for communication with the xApp
-CAPTURE_INTERFACE = "eth0"    # Interface inside the UPF container that sees the de-tunneled user traffic
+CAPTURE_INTERFACE = "tun0"    # Interface inside the UPF container that sees the de-tunneled user traffic
 WINDOW_SIZE = 10              # Number of packets to analyze per user before sending a report
-PREPROCESSOR_PATH = './preprocessor.pkl'
-
-# --- LOAD PRE-TRAINED ML COMPONENTS ---
-# These must be loaded once at the start for efficiency.
-try:
-    print("Loading preprocessors...")
-    with open(PREPROCESSOR_PATH, "rb") as f:
-        preprocessor = pickle.load(f)
-    print("preprocessors loaded successfully.")
-except FileNotFoundError:
-    print(f"ERROR: preprocessor files not found. Make sure '{PREPROCESSOR_PATH}' is in the same directory.")
-    exit(1)
 
 # --- FEATURE EXTRACTION LOGIC ---
 # Reverse mappings based on the traffic generator script
@@ -35,6 +23,8 @@ PORT_TO_SERVICE = {
     23: 'telnet', 143: 'imap4', 22: 'ssh', 53: 'domain', 7: 'echo', 9: 'discard',
 }
 
+sock = None
+
 flow_data = {
     'protocol_type': 'other',
     'service': 'other',
@@ -43,6 +33,34 @@ flow_data = {
 }
 packet_count = 0
 
+def connect_to_xapp():
+    global sock
+    # Close any existing broken socket
+    if sock:
+        try:
+            sock.close()
+        except Exception:
+            pass # Ignore errors on closing a broken socket
+
+    while True:
+        try:
+            print(f"Attempting to connect to xApp at {XAPP_HOST}:{XAPP_PORT}...")
+            # Create a new socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Set a timeout for the connection attempt
+            sock.settimeout(5.0) 
+            sock.connect((XAPP_HOST, XAPP_PORT))
+            # Set timeout to None (blocking) for normal operation
+            sock.settimeout(None) 
+            
+            print("Successfully connected to xApp.")
+            break # Exit the loop on success
+        except (ConnectionRefusedError, socket.timeout):
+            print("Connection failed. Retrying in 5 seconds...")
+            time.sleep(5)
+        except Exception as e:
+            print(f"An unexpected error occurred during connection: {e}. Retrying in 5s...")
+            time.sleep(5)
 
 def extract_features(packet):
     if not packet.haslayer(IP):
@@ -74,21 +92,12 @@ def extract_features(packet):
         if packet.haslayer(Raw):
             flow_data['dst_bytes'] += len(packet[Raw].load)
 
-# --- MAIN PACKET PROCESSING AND ML INFERENCE ---
-def preprocess():
-
-    df = pd.DataFrame([flow_data])
-    X_processed = preprocessor.transform(df).toarray()
-
-    return X_processed
-
 def packet_handler(packet):
     # We expect GTP-U encapsulated traffic. The inner packet has the UE's IP.
     if not packet.haslayer(GTP_U_Header) or not packet[GTP_U_Header].haslayer(IP):
         return
 
-    inner_ip_packet = packet[GTP_U_Header][IP]
-    extract_features(inner_ip_packet)
+    extract_features(packet)
 
     global packet_count
 
@@ -96,37 +105,39 @@ def packet_handler(packet):
 
     # If window is full, process and report
     if packet_count >= WINDOW_SIZE:
-        print(f"Window full, analyzing traffic...")
-        data = preprocess()
-
-        print(f"Analysis complete. DATA = {data}")
+        print(f"Window full, reporting traffic...")
 
         report_to_xapp()
+        
+        packet_count = 0
 
 # --- COMMUNICATION WITH XAPP ---
 def report_to_xapp():
     sst = 1
     sd = 5
+
+    report_data = {
+        "sst": sst,
+        "sd": sd,
+        "protocol_type": flow_data['protocol_type'],
+        "service": flow_data['service'],
+        "src_bytes": flow_data['src_bytes'],
+        "dst_bytes": flow_data['dst_bytes']
+    }
+    message = json.dumps(report_data)
+
+    global sock
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((XAPP_HOST, XAPP_PORT))
-
-            report_data = {
-                "sst": sst,
-                "sd": sd,
-                "protocol_type": flow_data['protocol_type'],
-                "service": flow_data['service'],
-                "src_bytes": flow_data['src_bytes'],
-                "dst_bytes": flow_data['dst_bytes']
-            }
-
-            message = json.dumps(report_data) + "\n"
-            s.sendall(message.encode('utf-8'))
-            print(f"Report sent to xApp: {message}")
-    except ConnectionRefusedError:
-        print(f"ERROR: Connection to xApp at {XAPP_HOST}:{XAPP_PORT} refused. Is the xApp running?")
-    except Exception as e:
-        print(f"An error occurred while sending report to xApp: {e}")
+        sock.sendall(f"{message}\n".encode())
+        print(f"Report sent to xApp: {message}")
+    except (BrokenPipeError, ConnectionResetError, AttributeError, OSError) as e:
+        print(f"Connection lost: {e}. Reconnecting and retrying...")
+        connect_to_xapp() # Re-establish connection
+        try:
+            sock.sendall(f"{message}\n".encode()) # Retry sending
+            print("Report sent successfully after reconnecting.")
+        except Exception as e2:
+            print(f"Failed to send even after reconnecting: {e2}")
 
 # --- MAIN EXECUTION BLOCK ---
 if __name__ == "__main__":
@@ -134,9 +145,12 @@ if __name__ == "__main__":
     print(f"Starting packet capture on interface: {CAPTURE_INTERFACE}")
     print(f"Will report to xApp at: {XAPP_HOST}:{XAPP_PORT}")
 
+    connect_to_xapp()
+
     # The store=0 argument prevents Scapy from keeping all packets in memory.
     try:
-        sniff(iface=CAPTURE_INTERFACE, prn=packet_handler, store=0)
+        subnet_filter = "net 12.1.1.0/24"
+        sniff(iface=CAPTURE_INTERFACE, filter=subnet_filter, prn=packet_handler, store=False)
     except Exception as e:
         print(f"An error occurred during packet sniffing: {e}")
         print("Please ensure this script is run with root privileges and the correct interface is specified.")
