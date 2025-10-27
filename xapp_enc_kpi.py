@@ -1,3 +1,4 @@
+import pickle
 import socket
 import time
 import threading
@@ -13,6 +14,7 @@ LISTENING_PORT = 8080
 
 # FHE model details
 MODEL_PATH = "./fhe_model_2_estimators_2_depth/"
+PREPROCESSOR_PATH = './preprocessor.pkl'
 
 # --- Database constants ---
 DB_NAME = "xapp_comm.db"
@@ -74,18 +76,19 @@ def decipher_model_response(encrypted_data, conn, row_id, fhe_client):
         print(f"[ERROR] Failed to decrypt message from xApp: {e}")
         raise
 
-def send_cipher_to_xapp(flow_data_json, fhe_client, conn):
+def send_cipher_to_xapp(flow_data_json, fhe_client, conn, preprocessor):
     print(f"[UPF_RECV] Received from UPF: {flow_data_json[:70]}...") # Log truncated message
     
     try:
-        pre_processed_flow_data = json.loads(flow_data_json)
-        df = pd.DataFrame([pre_processed_flow_data])
-        df_for_model = df.drop(columns=['sst', 'sd'])
+        flow_data = json.loads(flow_data_json)
 
-        encrypted_input = fhe_client.quantize_encrypt_serialize(df_for_model)
+        df = pd.DataFrame([flow_data])
         sst = int(df["sst"].iloc[0])
         sd = int(df["sd"].iloc[0])
+        df_for_model = df.drop(columns=['sst', 'sd'])
 
+        model_input = preprocessor.transform(df_for_model).toarray()
+        encrypted_input = fhe_client.quantize_encrypt_serialize(model_input)
 
         try:
             print(f"[DB_WRITE_TO_XAPP] Writing upf data to database.")
@@ -107,7 +110,7 @@ def send_cipher_to_xapp(flow_data_json, fhe_client, conn):
         print(f"[ERROR] Error in FHE processing (function_Y): {e}")
         return
 
-def listen_to_upf(upf_conn, fhe_client):
+def listen_to_upf(upf_conn, fhe_client, preprocessor):
     print("[INFO] UPF listener thread started.")
     conn = None
     try:
@@ -118,7 +121,7 @@ def listen_to_upf(upf_conn, fhe_client):
                 if not line:
                     print("[INFO] UPF disconnected.")
                     break
-                send_cipher_to_xapp(line.strip(), fhe_client, conn)
+                send_cipher_to_xapp(line.strip(), fhe_client, conn, preprocessor)
 
     except (IOError, socket.error) as e:
         print(f"[INFO] UPF connection error: {e}")
@@ -180,10 +183,21 @@ def listen_to_xapp(fhe_client):
             conn.close()
         print("[INFO] xApp listener thread stopped.")
 
+def load_preprocessor():
+    try:
+        print("Loading preprocessors...")
+        with open(PREPROCESSOR_PATH, "rb") as f:
+            preprocessor = pickle.load(f)
+            return preprocessor
+        print("preprocessors loaded successfully.")
+    except FileNotFoundError:
+        print(f"ERROR: preprocessor files not found. Make sure '{PREPROCESSOR_PATH}' is in the same directory.")
+        exit(1)
 
 def main():
     """Main function to set up connections and start listener threads."""
 
+    preprocessor = load_preprocessor()
     fhe_client = load_fhe_client()
     setup_database(DB_NAME)
 
@@ -204,7 +218,7 @@ def main():
         print(f"[INFO] UPF connected from {addr}")
 
         # 3. Start listener threads for both connections
-        upf_thread = threading.Thread(target=listen_to_upf, args=(upf_conn, fhe_client,))
+        upf_thread = threading.Thread(target=listen_to_upf, args=(upf_conn, fhe_client, preprocessor))
         xapp_thread = threading.Thread(target=listen_to_xapp, args=(fhe_client, ))
         
         upf_thread.daemon = True
