@@ -6,6 +6,7 @@ from scapy.layers.inet import *
 from scapy.all import *
 from scapy.contrib.gtp import GTP_U_Header
 import warnings
+import pickle
 
 # Suppress Scapy's verbose warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -15,18 +16,6 @@ XAPP_HOST = '192.168.70.1'    # IP of the machine running the RIC/xApp (likely t
 XAPP_PORT = 8080              # Arbitrary port for communication with the xApp
 CAPTURE_INTERFACE = "eth0"    # Interface inside the UPF container that sees the de-tunneled user traffic
 WINDOW_SIZE = 10              # Number of packets to analyze per user before sending a report
-PREPROCESSOR_PATH = './preprocessor.pkl'
-
-# --- LOAD PRE-TRAINED ML COMPONENTS ---
-# These must be loaded once at the start for efficiency.
-try:
-    print("Loading preprocessors...")
-    with open(PREPROCESSOR_PATH, "rb") as f:
-        preprocessor = pickle.load(f)
-    print("preprocessors loaded successfully.")
-except FileNotFoundError:
-    print(f"ERROR: preprocessor files not found. Make sure '{PREPROCESSOR_PATH}' is in the same directory.")
-    exit(1)
 
 # --- FEATURE EXTRACTION LOGIC ---
 # Reverse mappings based on the traffic generator script
@@ -75,21 +64,12 @@ def extract_features(packet):
         if packet.haslayer(Raw):
             flow_data['dst_bytes'] += len(packet[Raw].load)
 
-# --- MAIN PACKET PROCESSING AND ML INFERENCE ---
-def preprocess():
-
-    df = pd.DataFrame([flow_data])
-    X_processed = preprocessor.transform(df).toarray()
-
-    return X_processed
-
 def packet_handler(packet):
     # We expect GTP-U encapsulated traffic. The inner packet has the UE's IP.
     if not packet.haslayer(GTP_U_Header) or not packet[GTP_U_Header].haslayer(IP):
         return
 
-    inner_ip_packet = packet[GTP_U_Header][IP]
-    extract_features(inner_ip_packet)
+    extract_features(packet)
 
     global packet_count
 
@@ -97,12 +77,11 @@ def packet_handler(packet):
 
     # If window is full, process and report
     if packet_count >= WINDOW_SIZE:
-        print(f"Window full, analyzing traffic...")
-        data = preprocess()
-
-        print(f"Analysis complete. DATA = {data}")
+        print(f"Window full, reporting traffic...")
 
         report_to_xapp()
+        
+        packet_count = 0
 
 # --- COMMUNICATION WITH XAPP ---
 def report_to_xapp():
@@ -120,9 +99,8 @@ def report_to_xapp():
                 "src_bytes": flow_data['src_bytes'],
                 "dst_bytes": flow_data['dst_bytes']
             }
-
-            message = json.dumps(report_data) + "\n"
-            s.sendall(message.encode('utf-8'))
+            message = json.dumps(report_data)
+            s.sendall(f"{message}\n".encode())
             print(f"Report sent to xApp: {message}")
     except ConnectionRefusedError:
         print(f"ERROR: Connection to xApp at {XAPP_HOST}:{XAPP_PORT} refused. Is the xApp running?")
