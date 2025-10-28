@@ -17,7 +17,7 @@ MODEL_PATH = "./fhe_model_2_estimators_2_depth/"
 PREPROCESSOR_PATH = './preprocessor.pkl'
 
 # --- Database constants ---
-DB_NAME = "xapp_comm.db"
+DB_NAME = "messages.db"
 POLLING_INTERVAL = 1  # Seconds to wait between polling 
 
 def setup_database(db_name):

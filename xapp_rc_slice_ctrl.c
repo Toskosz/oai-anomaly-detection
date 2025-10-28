@@ -567,11 +567,14 @@ int main(int argc, char *argv[]) {
 
     // --- Main loop ---
     // This loop periodically polls the database for new messages
-    while (try_stop_xapp_api() == false) {
+    while (1) {
         poll_and_process_messages(nodes);
         usleep(POLLING_INTERVAL_US); // Wait for the next polling interval
     }
 
+    while (try_stop_xapp_api() == false) {
+        usleep(1000); // Wait for the next polling interval
+    }
     // --- Cleanup ---
     sqlite3_finalize(select_stmt);
     sqlite3_finalize(update_stmt);

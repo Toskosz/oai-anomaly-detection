@@ -4,7 +4,7 @@ from concrete.ml.deployment import FHEModelServer, FHEModelClient
 import sqlite3
 
 MODEL_PATH = "./fhe_model_2_estimators_2_depth/"
-DB_NAME = "xapp_comm.db"
+DB_NAME = "messages.db"
 POLLING_INTERVAL = 1
 
 def serialize_encrypted_prediction(encrypted_prediction):
