@@ -32,8 +32,8 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <sys/socket.h>
-#include <sqlite3.h> // Added for SQLite functionality
-#include <stdbool.h> // Added for bool type
+#include <sqlite3.h> // From File 2
+#include <stdbool.h> // From File 2
 
 #define PORT 8080
 #define MAX_CLIENTS 2 // Represents the number of slices we are managing
@@ -46,16 +46,18 @@
 typedef struct {
     int sst;
     int sd;
-    int prb_allocation;      // Current PRB allocation (0 or 100)
-    int prev_prb_allocation; // Previous PRB allocation
-    int rrc_ue_id;           // Mapped RRC UE ID for release
+    int normal_count;      
+    int anomaly_count;     
+    int prb_allocation;      
+    int prev_prb_allocation; 
+    int rrc_ue_id;           
 } ue_data_t;
 
 
 ue_data_t ue_data[MAX_CLIENTS];
 sqlite3 *db; // SQLite database handle
 sqlite3_stmt *select_stmt; // Prepared SELECT statement
-sqlite3_stmt *update_stmt; // Prepared UPDATE statement
+// REMOVED: sqlite3_stmt *update_stmt; 
 
 typedef enum{
     DRX_parameter_configuration_7_6_3_1 = 1,
@@ -119,8 +121,6 @@ void gen_rrm_policy_ratio_group(lst_ran_param_t* RRM_Policy_Ratio_Group,
                                 int max_ratio_prb)
 {
   // RRM Policy Ratio Group, STRUCTURE (RRM Policy Ratio List -> RRM Policy Ratio Group)
-  // lst_ran_param_t* RRM_Policy_Ratio_Group = &RRM_Policy_Ratio_List->ran_param_val.lst->lst_ran_param[0];
-  // RRM_Policy_Ratio_Group->ran_param_id = RRM_Policy_Ratio_Group_8_4_3_6;
   RRM_Policy_Ratio_Group->ran_param_struct.sz_ran_param_struct = 4;
   RRM_Policy_Ratio_Group->ran_param_struct.ran_param_struct = calloc(4, sizeof(seq_ran_param_t));
   assert(RRM_Policy_Ratio_Group->ran_param_struct.ran_param_struct != NULL && "Memory exhausted");
@@ -144,7 +144,6 @@ void gen_rrm_policy_ratio_group(lst_ran_param_t* RRM_Policy_Ratio_Group,
   assert(RRM_Policy_Member_List->ran_param_val.lst->lst_ran_param != NULL && "Memory exhausted");
   // RRM Policy Member, STRUCTURE (RRM Policy Member List -> RRM Policy Member)
   lst_ran_param_t* RRM_Policy_Member = &RRM_Policy_Member_List->ran_param_val.lst->lst_ran_param[0];
-  // RRM_Policy_Member->ran_param_id = RRM_Policy_Member_8_4_3_6;
   RRM_Policy_Member->ran_param_struct.sz_ran_param_struct = 2;
   RRM_Policy_Member->ran_param_struct.ran_param_struct = calloc(2, sizeof(seq_ran_param_t));
   assert(RRM_Policy_Member->ran_param_struct.ran_param_struct != NULL && "Memory exhausted");
@@ -174,7 +173,6 @@ void gen_rrm_policy_ratio_group(lst_ran_param_t* RRM_Policy_Ratio_Group,
   SST->ran_param_val.flag_false = calloc(1, sizeof(ran_parameter_value_t));
   assert(SST->ran_param_val.flag_false != NULL && "Memory exhausted");
   SST->ran_param_val.flag_false->type = OCTET_STRING_RAN_PARAMETER_VALUE;
-  // char sst_str[] = "1";
   byte_array_t sst = cp_str_to_ba(sst_str); //TODO
   SST->ran_param_val.flag_false->octet_str_ran.len = sst.len;
   SST->ran_param_val.flag_false->octet_str_ran.buf = sst.buf;
@@ -185,7 +183,6 @@ void gen_rrm_policy_ratio_group(lst_ran_param_t* RRM_Policy_Ratio_Group,
   SD->ran_param_val.flag_false = calloc(1, sizeof(ran_parameter_value_t));
   assert(SD->ran_param_val.flag_false != NULL && "Memory exhausted");
   SD->ran_param_val.flag_false->type = OCTET_STRING_RAN_PARAMETER_VALUE;
-  // char sd_str[] = "0";
   byte_array_t sd = cp_str_to_ba(sd_str); //TODO
   SD->ran_param_val.flag_false->octet_str_ran.len = sd.len;
   SD->ran_param_val.flag_false->octet_str_ran.buf = sd.buf;
@@ -196,7 +193,6 @@ void gen_rrm_policy_ratio_group(lst_ran_param_t* RRM_Policy_Ratio_Group,
   Min_PRB_Policy_Ratio->ran_param_val.flag_false = calloc(1, sizeof(ran_parameter_value_t));
   assert(Min_PRB_Policy_Ratio->ran_param_val.flag_false != NULL && "Memory exhausted");
   Min_PRB_Policy_Ratio->ran_param_val.flag_false->type = INTEGER_RAN_PARAMETER_VALUE;
-  // TODO: not handle this value in OAI
   Min_PRB_Policy_Ratio->ran_param_val.flag_false->int_ran = min_ratio_prb;
   // Max PRB Policy Ratio, ELEMENT (RRM Policy Ratio Group -> Max PRB Policy Ratio)
   seq_ran_param_t* Max_PRB_Policy_Ratio = &RRM_Policy_Ratio_Group->ran_param_struct.ran_param_struct[2];
@@ -205,7 +201,6 @@ void gen_rrm_policy_ratio_group(lst_ran_param_t* RRM_Policy_Ratio_Group,
   Max_PRB_Policy_Ratio->ran_param_val.flag_false = calloc(1, sizeof(ran_parameter_value_t));
   assert(Max_PRB_Policy_Ratio->ran_param_val.flag_false != NULL && "Memory exhausted");
   Max_PRB_Policy_Ratio->ran_param_val.flag_false->type = INTEGER_RAN_PARAMETER_VALUE;
-  // TODO: not handle this value in OAI
   Max_PRB_Policy_Ratio->ran_param_val.flag_false->int_ran = max_ratio_prb;
   // Dedicated PRB Policy Ratio, ELEMENT (RRM Policy Ratio Group -> Dedicated PRB Policy Ratio)
   seq_ran_param_t* Dedicated_PRB_Policy_Ratio = &RRM_Policy_Ratio_Group->ran_param_struct.ran_param_struct[3];
@@ -362,18 +357,149 @@ void enforce_slicing(e2_node_arr_xapp_t nodes) {
     free_rc_ctrl_req_data(&rc_ctrl);
 }
 
-// Polls the database for new messages and processes them
+/**
+ * This is the slicing logic imported from xapp_rc_slice_ctrl_socket.c (File 1)
+ */
+void parse_and_apply_slicing(e2_node_arr_xapp_t nodes) {
+    int total_packets[MAX_CLIENTS];
+    double anomaly_ratios[MAX_CLIENTS];
+    int total_prb_allocation = 0;
+    int prb_allocation[MAX_CLIENTS];
+    int attacker_index = -1;
+
+    // Calculate anomaly ratios and tentative PRB allocations
+    // This logic now reads from the global ue_data struct, which
+    // is populated by poll_and_process_messages()
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        total_packets[i] = ue_data[i].normal_count + ue_data[i].anomaly_count;
+        anomaly_ratios[i] = (total_packets[i] > 0) ? (double)ue_data[i].anomaly_count / total_packets[i] : 0;
+        
+        printf("Slice (SST: %d, SD: %d) Data: Normal=%d, Anomaly=%d, Total=%d, Ratio=%.2f\n",
+               ue_data[i].sst, ue_data[i].sd,
+               ue_data[i].normal_count, ue_data[i].anomaly_count, total_packets[i], anomaly_ratios[i]);
+
+        prb_allocation[i] = (int)((1.0 - anomaly_ratios[i]) * 100);
+        total_prb_allocation += prb_allocation[i];
+        
+        // File 1's attacker logic: ratio is exactly 1.0 (100%)
+        if (anomaly_ratios[i] == 1.0) {
+            attacker_index = i;
+        }
+    }
+
+    if (attacker_index != -1) {
+        printf("Attacker detected at index %d (SST: %d, SD: %d) with 100%% anomaly ratio.\n",
+               attacker_index, ue_data[attacker_index].sst, ue_data[attacker_index].sd);
+
+        // Set PRB allocation to 0% for the attacker
+        prb_allocation[attacker_index] = 0;
+	ue_data[attacker_index].prb_allocation = 0;
+
+        // Recalculate total PRB for scaling *other* UEs
+        total_prb_allocation = 0;
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (i != attacker_index) {
+                // We keep their original (1.0 - ratio) * 100 allocation
+                total_prb_allocation += prb_allocation[i];
+            }
+        }
+
+        // Scale *only* non-attackers if their total is > 100
+        if (total_prb_allocation > 100) {
+            printf("Scaling non-attacker PRB. Total was %d%%\n", total_prb_allocation);
+            double scaling_factor = 100.0 / total_prb_allocation;
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (i != attacker_index) {
+                    prb_allocation[i] = (int)(prb_allocation[i] * scaling_factor);
+                }
+            }
+        }
+
+        // Apply new PRB allocations (decrease first)
+        // Note: Attacker's allocation (0) is a decrease
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+	    if (i != attacker_index) {
+                if (prb_allocation[i] < ue_data[i].prev_prb_allocation) {
+                    ue_data[i].prb_allocation = prb_allocation[i];
+                    enforce_slicing(nodes);
+                    ue_data[i].prev_prb_allocation = ue_data[i].prb_allocation;
+                }
+	    }
+        }
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (i != attacker_index) {
+                if (prb_allocation[i] > ue_data[i].prev_prb_allocation) {
+                    ue_data[i].prb_allocation = prb_allocation[i];
+                    enforce_slicing(nodes);
+                    ue_data[i].prev_prb_allocation = ue_data[i].prb_allocation;
+                }
+	    }
+        }
+
+        // Trigger RRC release for the attacker
+        printf("Client %d (RAN UE ID: %d) has 100%% anomaly. Triggering RRC release.\n", attacker_index + 1, ue_data[attacker_index].rrc_ue_id);
+        rrc_release_ue(ue_data[attacker_index].rrc_ue_id);
+
+    } else {
+        printf("No 100%% attacker detected. Applying standard scaling if needed.\n");
+        // No attacker: Adjust *all* PRB allocations if total > 100%
+        if (total_prb_allocation > 100) {
+            printf("Total PRB (%d%%) > 100%%. Scaling down all slices...\n", total_prb_allocation);
+            double scaling_factor = 100.0 / total_prb_allocation;
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                prb_allocation[i] = (int)(prb_allocation[i] * scaling_factor);
+            }
+        }
+
+        // Apply slicing changes (decrease first)
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (prb_allocation[i] < ue_data[i].prev_prb_allocation) {
+                ue_data[i].prb_allocation = prb_allocation[i];
+                enforce_slicing(nodes);
+                ue_data[i].prev_prb_allocation = ue_data[i].prb_allocation;
+            }
+        }
+
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (prb_allocation[i] > ue_data[i].prev_prb_allocation) {
+                ue_data[i].prb_allocation = prb_allocation[i];
+                enforce_slicing(nodes);
+                ue_data[i].prev_prb_allocation = ue_data[i].prb_allocation;
+            }
+        }
+    }
+
+    // Print the final allocations
+    printf("Final allocations enforced:\n");
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        printf("  - Client %d (SST: %d, SD: %d) PRB allocation: %d%%\n", i + 1, ue_data[i].sst, ue_data[i].sd, ue_data[i].prb_allocation);
+    }
+}
+
+
+/**
+ * MODIFIED FUNCTION:
+ * Polls DB using sliding window, populates global ue_data,
+ * and calls the slicing logic.
+ */
 void poll_and_process_messages(e2_node_arr_xapp_t nodes) {
 
-    bool policy_changed = false;
-    int processed_ids[256]; // Simple array to hold IDs of processed messages
-    int id_count = 0;
+    bool data_received = false; 
+    
+    // Clear old data to 0 before polling
+    // This ensures slices not in the latest 30 packets are reset
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        ue_data[i].normal_count = 0;
+        ue_data[i].anomaly_count = 0;
+    }
 
-    // Loop through all messages with status = 2
+    // Loop through the aggregated results from the sliding window query
     while (sqlite3_step(select_stmt) == SQLITE_ROW) {
-        int sst = sqlite3_column_int(select_stmt, 1);
-        int sd = sqlite3_column_int(select_stmt, 2);
-        int anomaly_count = sqlite3_column_double(select_stmt, 3);
+        
+        int sst = sqlite3_column_int(select_stmt, 0);
+        int sd = sqlite3_column_int(select_stmt, 1);
+        double anomaly_count_db = sqlite3_column_double(select_stmt, 2); // SUM(anomaly_percentage)
+        int total_group_count = sqlite3_column_int(select_stmt, 3); // COUNT(*)
 
         // Find the corresponding slice in our state array
         int ue_index = -1;
@@ -386,82 +512,28 @@ void poll_and_process_messages(e2_node_arr_xapp_t nodes) {
 
         if (ue_index == -1) {
             fprintf(stderr, "Warning: Ignoring message for unknown slice (SST: %d, SD: %d)\n", sst, sd);
-            processed_ids[id_count++] = id; // Mark as processed even if unknown
             continue;
         }
 
-        // Determine new policy based on anomaly flag
-        int new_prb_allocation = (anomaly_percentage >= 0.95) ? 0 : (int)((1.0 - anomaly_percentage) * 100);
-
-        // Check if this new policy is different from the current one
-        if (ue_data[ue_index].prb_allocation != new_prb_allocation) {
-            ue_data[ue_index].prb_allocation = new_prb_allocation;
-            policy_changed = true;
-            printf("Policy change for Slice (SST: %d, SD: %d): Set PRB to %d%%\n", sst, sd, new_prb_allocation);
-        }
+        // Populate the global struct
+        ue_data[ue_index].anomaly_count = (int)anomaly_count_db;
+        ue_data[ue_index].normal_count = total_group_count - ue_data[ue_index].anomaly_count;
+        data_received = true;
         
-        processed_ids[id_count++] = id; // Add to list of messages to update
-        if(id_count >= 256) break; // Avoid buffer overflow if too many messages
+        printf("DB Poll: Slice (SST: %d, SD: %d) | Total in window: %d | Anomaly: %d | Normal: %d\n",
+               sst, sd, total_group_count, ue_data[ue_index].anomaly_count, ue_data[ue_index].normal_count);
     }
     sqlite3_reset(select_stmt);
 
-    // If any policy changed, enforce the new policies
-    if (policy_changed) {
-
-	int total_prb_allocation = 0;
-        int attacker_index = -1;
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            total_prb_allocation += ue_data[i].prb_allocation;
-            if (ue_data[i].prb_allocation == 0) {
-                attacker_index = i;
-            }
-        }
-
-	// Don't scale if there's an attacker (let them be 0)
-        // Only scale if there's no attacker AND total is over 100
-        if (total_prb_allocation > 100 && attacker_index == -1) {
-            printf("Total PRB (%d%%) > 100%%. Scaling down...\n", total_prb_allocation);
-            double scaling_factor = 100.0 / total_prb_allocation;
-            for (int i = 0; i < MAX_CLIENTS; i++) {
-                ue_data[i].prb_allocation = (int)(ue_data[i].prb_allocation * scaling_factor);
-            }
-        }
-
-
-        // This sends the full list of policies (for all slices) to the E2 node
-        enforce_slicing(nodes);
-
-        // After enforcement, check if we need to RRC release anyone
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            // Check if the *newly enforced* policy is different from the *previous* one
-            if (ue_data[i].prb_allocation != ue_data[i].prev_prb_allocation) {
-
-                // If the new policy is 0%, trigger RRC release
-                if (ue_data[i].prb_allocation == 0) {
-                    printf("Slice (SST: %d, SD: %d) identified as anomaly. Triggering RRC release for UE %d.\n",
-                           ue_data[i].sst, ue_data[i].sd, ue_data[i].rrc_ue_id);
-                    rrc_release_ue(ue_data[i].rrc_ue_id);
-                }
-
-                // Update the previous allocation to match the new one
-                ue_data[i].prev_prb_allocation = ue_data[i].prb_allocation;
-            }
-        }
+    // If we got new data, call the slicing function from File 1
+    if (data_received) {
+        printf("New data received from DB. Applying slicing logic...\n");
+        parse_and_apply_slicing(nodes);
+    } else {
+        printf("No new data found in DB poll.\n");
     }
-
-    // Now, update the status of all processed messages in the database
-    if (id_count > 0) {
-        printf("Processing %d messages from database...\n", id_count);
-
-        for (int i = 0; i < id_count; i++) {
-            sqlite3_bind_int(update_stmt, 1, processed_ids[i]);
-            if (sqlite3_step(update_stmt) != SQLITE_DONE) {
-                fprintf(stderr, "Failed to update message ID %d: %s\n", processed_ids[i], sqlite3_errmsg(db));
-            }
-            sqlite3_reset(update_stmt); // Reset for next iteration
-        }
-        printf("Finished processing %d messages.\n", id_count);
-    }
+    
+    // REMOVED: All code for processed_ids, id_count, and database updates.
 }
 
 
@@ -484,7 +556,7 @@ int main(int argc, char *argv[]) {
         "sd INTEGER NOT NULL,"
         "encrypted_input BLOB,"
 	"encrypted_prediction_result BLOB,"
-        "anomaly_percentage REAL,"
+        "anomaly_percentage REAL," // This field should be 1 for anomaly, 0 for normal
         "status INTEGER NOT NULL,"
         "timestamp DATETIME DEFAULT CURRENT_TIMESTAMP"
         ");";
@@ -498,20 +570,20 @@ int main(int argc, char *argv[]) {
     puts("Table 'messages' is ready.");
 
     // --- Prepare SQL statements ONCE ---
-    const char *sql_select = "SELECT t.sst, t.sd, SUM(t.anomaly_percentage) FROM (SELECT sst, sd, anomaly_percentage from messages WHERE status = 2 ORDER BY timestamp DESC LIMIT 30) as t GROUP BY t.sst, t.sd ;";
+    // MODIFIED: This query implements the 30-row sliding window
+    const char *sql_select = 
+        "SELECT t.sst, t.sd, SUM(t.anomaly_percentage), COUNT(*) "
+        "FROM (SELECT sst, sd, anomaly_percentage from messages ORDER BY timestamp DESC LIMIT 30) as t "
+        "GROUP BY t.sst, t.sd ;";
+
     if (sqlite3_prepare_v2(db, sql_select, -1, &select_stmt, 0) != SQLITE_OK) {
         fprintf(stderr, "Failed to prepare select statement: %s\n", sqlite3_errmsg(db));
         sqlite3_close(db);
         return 1;
     }
 
-    const char *sql_update = "UPDATE messages SET status = 3 WHERE id = ?;";
-    if (sqlite3_prepare_v2(db, sql_update, -1, &update_stmt, 0) != SQLITE_OK) {
-        fprintf(stderr, "Failed to prepare update statement: %s\n", sqlite3_errmsg(db));
-        sqlite3_finalize(select_stmt); // Clean up the one that succeeded
-        sqlite3_close(db);
-        return 1;
-    }
+    // REMOVED: Preparation of update_stmt
+    
     puts("SQL statements prepared successfully.");
 
     // --- Initialize xApp ---
@@ -533,13 +605,14 @@ int main(int argc, char *argv[]) {
 
 
     // --- Initialize Slice State ---
-    // This xApp is hardcoded to manage two specific slices
     // Slice 1: SST=1, SD=1
     ue_data[0].sst = 1;
     ue_data[0].sd = 1;
     ue_data[0].prb_allocation = 50; // Default to 50%
     ue_data[0].prev_prb_allocation = 50;
     ue_data[0].rrc_ue_id = 1; // Mapped UE ID for RRC release
+    ue_data[0].normal_count = 50; 
+    ue_data[0].anomaly_count = 0; 
 
     // Slice 2: SST=1, SD=5
     ue_data[1].sst = 1;
@@ -547,17 +620,13 @@ int main(int argc, char *argv[]) {
     ue_data[1].prb_allocation = 50; // Default to 50%
     ue_data[1].prev_prb_allocation = 50;
     ue_data[1].rrc_ue_id = 2; // Mapped UE ID for RRC release
+    ue_data[1].normal_count = 50; 
+    ue_data[1].anomaly_count = 0; 
     
 
     ////////////
     // START RC
     ////////////
-
-    // RC Control
-    // CONTROL Service Style 2: Radio Resource Allocation Control
-    // Action ID 6: Slice-level PRB quota
-    // E2SM-RC Control Header Format 1
-    // E2SM-RC Control Message Format 1
     
     // Send initial default allocation (50/50)
     puts("Sending initial 50/50 PRB allocation...");
@@ -576,7 +645,7 @@ int main(int argc, char *argv[]) {
     }
     // --- Cleanup ---
     sqlite3_finalize(select_stmt);
-    sqlite3_finalize(update_stmt);
+    // REMOVED: finalize(update_stmt)
     puts("Prepared statements finalized.");
     sqlite3_close(db);
     puts("Database closed.");
