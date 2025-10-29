@@ -61,6 +61,7 @@ def decipher_model_response(encrypted_data, conn, row_id, fhe_client):
     print(f"[DB_RECV] Processing job {row_id} with {len(encrypted_data)} encrypted bytes from DB.")
     try:
         result = fhe_client.deserialize_decrypt_dequantize(encrypted_data)
+        flag = 1 if result[0][1] > 0.95 else 0 
 
         try:
             conn.execute("""
@@ -68,7 +69,7 @@ def decipher_model_response(encrypted_data, conn, row_id, fhe_client):
                 SET anomaly_percentage = ?,
                     status = 2
                 WHERE id = ?
-            """, (result[0][1], row_id))
+            """, (flag, row_id))
             conn.commit()
         except Exception as e:
             print(f"[ERROR] Failed to write prediction result for job {row_id}: {e}")
