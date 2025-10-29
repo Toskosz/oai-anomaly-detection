@@ -371,10 +371,9 @@ void poll_and_process_messages(e2_node_arr_xapp_t nodes) {
 
     // Loop through all messages with status = 2
     while (sqlite3_step(select_stmt) == SQLITE_ROW) {
-        int id = sqlite3_column_int(select_stmt, 0);
         int sst = sqlite3_column_int(select_stmt, 1);
         int sd = sqlite3_column_int(select_stmt, 2);
-        int anomaly_percentage = sqlite3_column_double(select_stmt, 3);
+        int anomaly_count = sqlite3_column_double(select_stmt, 3);
 
         // Find the corresponding slice in our state array
         int ue_index = -1;
@@ -499,7 +498,7 @@ int main(int argc, char *argv[]) {
     puts("Table 'messages' is ready.");
 
     // --- Prepare SQL statements ONCE ---
-    const char *sql_select = "SELECT id, sst, sd, anomaly_percentage FROM messages WHERE status = 2 ORDER BY timestamp ASC;";
+    const char *sql_select = "SELECT t.sst, t.sd, SUM(t.anomaly_percentage) FROM (SELECT sst, sd, anomaly_percentage from messages WHERE status = 2 ORDER BY timestamp DESC LIMIT 30) as t GROUP BY t.sst, t.sd ;";
     if (sqlite3_prepare_v2(db, sql_select, -1, &select_stmt, 0) != SQLITE_OK) {
         fprintf(stderr, "Failed to prepare select statement: %s\n", sqlite3_errmsg(db));
         sqlite3_close(db);
